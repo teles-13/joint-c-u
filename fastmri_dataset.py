@@ -6,6 +6,7 @@ import h5py
 import torch
 import numpy as np
 from torch.utils.data import Dataset
+from pisco_g_matrix import compute_G_for_fastmri_slice
 
 class JointFastMRIDataset(Dataset):
     """
@@ -73,8 +74,6 @@ class JointFastMRIDataset(Dataset):
         Finv = torch.fft.ifftshift(f_kspace, dim=(-2, -1))
         Finv = torch.fft.ifft2(Finv, norm="ortho")
         Finv = torch.fft.fftshift(Finv, dim=(-2, -1))
-        
-        # 假设 c_0 全为1，那么 u_0 就是简单的全通道复数求和
         input0 = torch.sum(Finv, dim=-3)
 
         # 应用 Paper Norm 归一化
@@ -83,12 +82,16 @@ class JointFastMRIDataset(Dataset):
         target_norm = target * paper_norm
         k_slice_norm = k_slice * paper_norm
 
-        # 💡 返回的字典中去掉了 'coil_sens'
+        # 在 Dataset 中直接计算 G_tensor
+        k_slice_np = k_slice_norm.numpy()
+        G_tensor = compute_G_for_fastmri_slice(k_slice_np, cal_length=32)
+
         return {
-            'u_t': input0_norm,                                     # 盲重建的初始图像 (B, 640, 320)
-            'f': f_norm,                                            # 欠采样k空间
-            'sampling_mask': mask.real.to(torch.float32).squeeze(0),# 掩膜
-            'reference': target_norm,                               # Ground truth
-            'kspace_raw': k_slice_norm,                             # 全采样k空间 (用于计算G)
+            'u_t': input0_norm,                                     
+            'f': f_norm,                                            
+            'sampling_mask': mask.real.to(torch.float32).squeeze(0),
+            'reference': target_norm,                               
+            'kspace_raw': k_slice_norm,                             
+            'G_tensor': G_tensor, # <--- 新增返回算好的张量
             'slice_idx': s_idx
         }
