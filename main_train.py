@@ -34,10 +34,10 @@ def main():
     
     # 初始化数据集
     dataset = JointFastMRIDataset(data_dir=data_dir, target_shape=(16, 16, 640, 320), target_slice=7)
-    dataloader = DataLoader(dataset, batch_size=4, shuffle=True, num_workers=0, pin_memory=True)
+    dataloader = DataLoader(dataset, batch_size=2, shuffle=True, num_workers=4, pin_memory=True)
     
     model = VariationalNetwork(num_steps=10, num_filters=24).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=5e-6)
+    optimizer = optim.Adam(model.parameters(), lr=1e-4)
     
     num_epochs = 1000
     loss_hist, mse_hist, ssim_hist, psnr_hist = [], [], [], []
@@ -49,47 +49,32 @@ def main():
         num_batches = len(dataloader)
         
         for batch_idx, data_dict in enumerate(dataloader):
-            # 获取数据
             u_t = data_dict['u_t'].to(device)                 
             f_kspace = data_dict['f'].to(device)              
             mask = data_dict['sampling_mask'].to(device)      
             target = data_dict['reference'].to(device)        
-            kspace_raw = data_dict['kspace_raw']              
+            G_tensor_batch = data_dict['G_tensor'].to(device) # <--- 直接获取 batch G_tensor
             current_slice = data_dict['slice_idx'][0].item() 
             
             B, Nc, H, W = f_kspace.shape
-            
-            # =========================================================
-            # 你的物理底座：动态计算本批次的 G 矩阵
-            # =========================================================
-            G_tensor_list = []
-            for i in range(B):
-                k_slice_np = kspace_raw[i].numpy() 
-                g_tensor_single = compute_G_for_fastmri_slice(k_slice_np, cal_length=32)
-                G_tensor_list.append(g_tensor_single)
-            G_tensor_batch = torch.stack(G_tensor_list).to(device)
             
             # 调整维度
             if u_t.dim() == 3: u_t = u_t.unsqueeze(1) 
             if target.dim() == 3: target = target.unsqueeze(1)
             if mask.dim() == 3: mask = mask.unsqueeze(1)
 
-            # =========================================================
-            # 你的核心实验点：盲重建初始化 (c 设为全 1)
-            # =========================================================
             c_init = torch.ones(B, Nc, H, W, dtype=torch.complex64).to(device) 
             
             optimizer.zero_grad()
-            
-            # 传入网络进行交替联合优化
             u_pred_unprocessed, c_final = model(f_kspace, mask, G_tensor_batch, u_t, c_init)
             
-            # 裁剪并计算 Loss
             u_pred = center_crop(u_pred_unprocessed, (320, 320))
             target_cropped = center_crop(target, (320, 320))
             
-            target_complex = target_cropped.to(torch.complex64)
-            loss = F.mse_loss(torch.view_as_real(u_pred), torch.view_as_real(target_complex))
+            # <--- 修正 Loss：在幅值域计算 MSE
+            u_pred_mag = torch.abs(u_pred)
+            target_mag = torch.abs(target_cropped)
+            loss = F.mse_loss(u_pred_mag, target_mag)
             
             loss.backward()
             optimizer.step()
