@@ -47,7 +47,7 @@ class VNImageBlock(nn.Module):
             blocks.append(PaperConvBlock(num_filters, num_filters))
         
         self.feature_extractor = nn.Sequential(*blocks)
-        self.final_conv = spectral_norm(nn.Conv2d(num_filters, 2, kernel_size=3, padding=1)) [cite: 290]
+        self.final_conv = spectral_norm(nn.Conv2d(num_filters, 2, kernel_size=3, padding=1))
         
         self.radius = 1.0 # 论文指定的投影半径 r=1 [cite: 479]
 
