@@ -13,7 +13,7 @@ from skimage.metrics import structural_similarity as ssim_func
 # 导入你写好的各个模块
 from fastmri_dataset import JointFastMRIDataset 
 from pisco_g_matrix import compute_G_for_fastmri_slice
-from networks import VariationalNetwork  # 导入我们刚刚理清的网络
+from networks import VariationalNetwork  
 
 # 锁定 GPU
 os.environ["CUDA_VISIBLE_DEVICES"] = "3"
@@ -34,7 +34,7 @@ def main():
     
     # 初始化数据集
     dataset = JointFastMRIDataset(data_dir=data_dir, target_shape=(16, 16, 640, 320), target_slice=7)
-    dataloader = DataLoader(dataset, batch_size=2, shuffle=True, num_workers=4, pin_memory=True)
+    dataloader = DataLoader(dataset, batch_size=1, shuffle=True, num_workers=4, pin_memory=True)
     
     model = VariationalNetwork(num_steps=10, num_filters=24).to(device)
     optimizer = optim.Adam(model.parameters(), lr=1e-4)
@@ -53,7 +53,11 @@ def main():
             f_kspace = data_dict['f'].to(device)              
             mask = data_dict['sampling_mask'].to(device)      
             target = data_dict['reference'].to(device)        
-            G_tensor_batch = data_dict['G_tensor'].to(device) # <--- 直接获取 batch G_tensor
+            G_tensor_batch = data_dict['G_tensor'].to(device) 
+            
+            # === 1. 修改：直接从 data_dict 中提取在 Dataset 里算好的 c_init ===
+            c_init = data_dict['c_init'].to(device)
+            
             current_slice = data_dict['slice_idx'][0].item() 
             
             B, Nc, H, W = f_kspace.shape
@@ -63,9 +67,11 @@ def main():
             if target.dim() == 3: target = target.unsqueeze(1)
             if mask.dim() == 3: mask = mask.unsqueeze(1)
 
-            c_init = torch.ones(B, Nc, H, W, dtype=torch.complex64).to(device) 
+            # === 2. 修改：注销或删掉下面这行原有的全 1 初始化代码 ===
+            # c_init = torch.ones(B, Nc, H, W, dtype=torch.complex64).to(device) 
             
             optimizer.zero_grad()
+            # 此时传入模型的 c_init 已经包含了物理合理的空间平滑度与线圈间相位差
             u_pred_unprocessed, c_final = model(f_kspace, mask, G_tensor_batch, u_t, c_init)
             
             u_pred = center_crop(u_pred_unprocessed, (320, 320))
@@ -115,6 +121,7 @@ def main():
                 epoch_psnr += avg_batch_psnr
 
                 # 每 50 个 batch 画一次图
+                # 每 50 个 batch 画一次图
                 if batch_idx == 0 or (batch_idx + 1) % 50 == 0:
                     under_mag_img = center_crop(torch.abs(u_t), (320, 320)).cpu().detach().numpy()[0, 0]
                     recon_img = recon_mag_np[0, 0]
@@ -123,13 +130,39 @@ def main():
                     error_scale = 1.0
                     error_map = np.abs(ref_img - recon_img) * error_scale
                     
-                    combined_img = np.concatenate((under_mag_img, recon_img, ref_img, error_map), axis=1)
-                    combined_img_uint8 = np.clip(combined_img * 255.0, 0, 255).astype(np.uint8)
+                    # ✨ 新增：提取估计出的敏感度图 c，进行中心裁剪并取第 0 个通道（第一个线圈）
+                    c_final_cropped = center_crop(c_final, (320, 320))
+                    c_img = torch.abs(c_final_cropped).cpu().detach().numpy()[0, 0]
                     
-                    plt.figure(figsize=(15, 5))
-                    plt.imshow(combined_img_uint8, cmap='gray', vmin=0, vmax=255)
-                    plt.title(f"Epoch {epoch+1} | Batch {batch_idx+1} - Recon Result (Slice {current_slice})")
-                    plt.axis('off')
+                    # 改用 subplots 布局，一行放 5 张图
+                    fig, axes = plt.subplots(1, 5, figsize=(20, 4))
+                    
+                    # 1. 欠采样输入图
+                    axes[0].imshow(under_mag_img, cmap='gray')
+                    axes[0].set_title("Input (Zero-filled)")
+                    axes[0].axis('off')
+                    
+                    # 2. 模型重建图 u
+                    axes[1].imshow(recon_img, cmap='gray')
+                    axes[1].set_title("Recon Image (u)")
+                    axes[1].axis('off')
+                    
+                    # 3. 真实参考图
+                    axes[2].imshow(ref_img, cmap='gray')
+                    axes[2].set_title("Reference (GT)")
+                    axes[2].axis('off')
+                    
+                    # 4. 误差图
+                    axes[3].imshow(error_map, cmap='gray')
+                    axes[3].set_title("Error Map")
+                    axes[3].axis('off')
+                    
+                    # 5. ✨ 新增：估计出的线圈敏感度图 c（自动适应其特有的数值范围）
+                    axes[4].imshow(c_img, cmap='gray')
+                    axes[4].set_title("Estimated Smap (Coil 0)")
+                    axes[4].axis('off')
+                    
+                    plt.suptitle(f"Epoch {epoch+1} | Batch {batch_idx+1} - Result (Slice {current_slice})")
                     plt.tight_layout()
                     plt.savefig(os.path.join(image_save_dir, f'recon_epoch_{epoch+1:03d}_batch_{batch_idx+1:04d}.png'), bbox_inches='tight')
                     plt.close()
