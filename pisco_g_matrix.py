@@ -105,7 +105,7 @@ def G_matrices(kCal, N1, N2, tau, U, kernel_shape):
     n2, n1 = np.meshgrid(n2, n1, indexing='xy')
     phaseKernel = np.exp(-1j * 2 * np.pi * (n1 * (N1_g - 2*tau - 1) + n2 * (N2_g - 2*tau - 1)))
     
-    G = np.fft.fft2(np.conj(G), s=(N1_g, N2_g), axes=(0,1)) * phaseKernel[:, :, np.newaxis, np.newaxis]
+    G = np.fft.fft2(np.conj(G), s=(N1_g, N2_g), axes=(0,1), norm='ortho') * phaseKernel[:, :, np.newaxis, np.newaxis]
     G = np.fft.fftshift(G, axes=(0,1))
     
     return G
