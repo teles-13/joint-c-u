@@ -86,12 +86,37 @@ class JointFastMRIDataset(Dataset):
         k_slice_np = k_slice_norm.numpy()
         G_tensor = compute_G_for_fastmri_slice(k_slice_np, cal_length=32)
 
+        Nc, H, W = k_slice_norm.shape
+        cal_length = 32  # 保持与自校准区域一致的尺度
+        
+        # 1. 创建一个全零的 k 空间矩阵，仅保留中心 ACS 区域
+        kspace_acs = torch.zeros_like(k_slice_norm)
+        
+        # 提取中心低频区域 (32x32)
+        h_start, h_end = H // 2 - cal_length // 2, H // 2 + cal_length // 2
+        w_start, w_end = W // 2 - cal_length // 2, W // 2 + cal_length // 2
+        kspace_acs[:, h_start:h_end, w_start:w_end] = k_slice_norm[:, h_start:h_end, w_start:w_end]
+        
+        # 2. 逆傅里叶变换到图像域，得到低分辨率平滑线圈图像 (使用标准的中心化 ifft2c 逻辑)
+        img_low = torch.fft.ifftshift(kspace_acs, dim=(-2, -1))
+        img_low = torch.fft.ifft2(img_low, norm="ortho")
+        img_low = torch.fft.fftshift(img_low, dim=(-2, -1))
+        
+        # 3. 计算多线圈低分辨图像的平方和根 (RSS)
+        rss_low = torch.sqrt(torch.sum(torch.abs(img_low) ** 2, dim=0, keepdim=True) + 1e-8)
+        
+        # 4. 线圈图像除以 RSS 得到初始的敏感度图分布
+        c_init_lowres = img_low / rss_low
+        # =========================================================================
+
         return {
             'u_t': input0_norm,                                     
             'f': f_norm,                                            
             'sampling_mask': mask.real.to(torch.float32).squeeze(0),
             'reference': target_norm,                               
             'kspace_raw': k_slice_norm,                             
-            'G_tensor': G_tensor, # <--- 新增返回算好的张量
+            'G_tensor': G_tensor, 
+            'c_init': c_init_lowres,  # <--- 将算好的初始敏感度图传给 DataLoader
             'slice_idx': s_idx
         }
+       
