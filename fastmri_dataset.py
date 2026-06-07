@@ -69,46 +69,51 @@ class JointFastMRIDataset(Dataset):
 
         mask = self.fixed_mask.clone()
         f_kspace = k_slice * mask
-        
-        # 💡 BPMRI 初始化：在不知敏感度的情况下的初始图像
-        Finv = torch.fft.ifftshift(f_kspace, dim=(-2, -1))
-        Finv = torch.fft.ifft2(Finv, norm="ortho")
-        Finv = torch.fft.fftshift(Finv, dim=(-2, -1))
-        input0 = torch.sum(Finv, dim=-3)
 
-        # 应用 Paper Norm 归一化
-        f_norm = f_kspace * paper_norm
-        input0_norm = input0 * paper_norm
-        target_norm = target * paper_norm
-        k_slice_norm = k_slice * paper_norm
+        # =========================================================================
+        # ✨ 路线 A 核心修改：最大值归一化 ✨
+        # 目的：强行把真实图像的最大像素值压到 1.0，以完美匹配文献中的 r1 = 1.0 理论约束
+        # =========================================================================
+        target_max = torch.max(torch.abs(target)) + 1e-8
+        scale_factor = 1.0 / target_max
 
-        # 在 Dataset 中直接计算 G_tensor
-        k_slice_np = k_slice_norm.numpy()
-        G_tensor = compute_G_for_fastmri_slice(k_slice_np, cal_length=32)
+        # 使用最大值缩放因子替代 paper_norm
+        f_norm = f_kspace * scale_factor
+        target_norm = target * scale_factor
+        k_slice_norm = k_slice * scale_factor
 
+        # =========================================================================
+        # 提前计算初始敏感度图 c_init_lowres (保留我们之前第二步的修复)
+        # =========================================================================
         Nc, H, W = k_slice_norm.shape
-        cal_length = 32  # 保持与自校准区域一致的尺度
-        
-        # 1. 创建一个全零的 k 空间矩阵，仅保留中心 ACS 区域
+        cal_length = 32  
         kspace_acs = torch.zeros_like(k_slice_norm)
         
-        # 提取中心低频区域 (32x32)
         h_start, h_end = H // 2 - cal_length // 2, H // 2 + cal_length // 2
         w_start, w_end = W // 2 - cal_length // 2, W // 2 + cal_length // 2
         kspace_acs[:, h_start:h_end, w_start:w_end] = k_slice_norm[:, h_start:h_end, w_start:w_end]
         
-        # 2. 逆傅里叶变换到图像域，得到低分辨率平滑线圈图像 (使用标准的中心化 ifft2c 逻辑)
         img_low = torch.fft.ifftshift(kspace_acs, dim=(-2, -1))
         img_low = torch.fft.ifft2(img_low, norm="ortho")
         img_low = torch.fft.fftshift(img_low, dim=(-2, -1))
         
-        # 3. 计算多线圈低分辨图像的平方和根 (RSS)
         rss_low = torch.sqrt(torch.sum(torch.abs(img_low) ** 2, dim=0, keepdim=True) + 1e-8)
-        
-        # 4. 线圈图像除以 RSS 得到初始的敏感度图分布
         c_init_lowres = img_low / rss_low
-        # =========================================================================
 
+        # =========================================================================
+        # 使用最优线圈合并计算 u 的初始估计 (消除相位抵消)
+        # =========================================================================
+        Finv = torch.fft.ifftshift(f_kspace, dim=(-2, -1))
+        Finv = torch.fft.ifft2(Finv, norm="ortho")
+        Finv = torch.fft.fftshift(Finv, dim=(-2, -1))
+        
+        input0 = torch.sum(Finv * torch.conj(c_init_lowres), dim=-3)
+        # 同样使用 scale_factor 进行缩放
+        input0_norm = input0 * scale_factor
+
+        # 计算 G_tensor
+        k_slice_np = k_slice_norm.numpy()
+        G_tensor = compute_G_for_fastmri_slice(k_slice_np, cal_length=32)
         return {
             'u_t': input0_norm,                                     
             'f': f_norm,                                            
