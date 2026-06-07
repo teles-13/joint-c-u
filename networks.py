@@ -84,9 +84,13 @@ class VNImageBlock(nn.Module):
 class VNSensitivityBlock(nn.Module):
     def __init__(self):
         super().__init__()
-        # 初始化为负数，经过 softplus 后起步较小，防止梯度爆炸
-        self.beta_step = nn.Parameter(torch.tensor(-2.0, dtype=torch.float32))  
-        self.lambda_reg = nn.Parameter(torch.tensor(-1.0, dtype=torch.float32)) 
+        # 略微调高步长初始值，让物理梯度下降的步伐更稳
+        self.beta_step = nn.Parameter(torch.tensor(-1.0, dtype=torch.float32))  
+        
+        # ✨ 第四步核心修改：提升 G 矩阵先验的初始话语权 ✨
+        # 将 -1.0 改为 1.0。经过 softplus 后初始权重约为 1.31。
+        # 这确保了在训练初期，G 矩阵能以强势的物理规则引导敏感度图的走向，防止其胡乱更新
+        self.lambda_reg = nn.Parameter(torch.tensor(1.0, dtype=torch.float32)) 
 
     def forward(self, c_k, u_next, f_kspace, mask, G_tensor):
         ops = MRPhysicsOperators()
@@ -104,7 +108,19 @@ class VNSensitivityBlock(nn.Module):
         grad_c_prior = lamb * torch.einsum('bhwij, bjhw -> bihw', G_tensor, c_k)
 
         # 3. 联合更新 c
+        # 3. 联合更新 c
         c_next = c_k - beta * (grad_c_fidelity + grad_c_prior)
+        
+        # ==========================================
+        # ✨ 第一步核心修改：显式物理归一化 (RSS = 1) ✨
+        # 目的：打破 C * u 的尺度歧义，防止 C 坍缩为 0，逼迫网络去学真实的 u
+        # ==========================================
+        # 计算当前各通道的平方和的算术平方根 (Root Sum of Squares)
+        c_rss = torch.sqrt(torch.sum(torch.abs(c_next)**2, dim=1, keepdim=True) + 1e-8)
+        
+        # 强行将 C 投影到物理流形上（除以 rss）
+        c_next = c_next / c_rss
+        
         return c_next
 
 # ==========================================
