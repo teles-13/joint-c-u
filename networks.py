@@ -119,7 +119,7 @@ class VNSensitivityBlock(nn.Module):
         c_rss = torch.sqrt(torch.sum(torch.abs(c_next)**2, dim=1, keepdim=True) + 1e-8)
         
         # 强行将 C 投影到物理流形上（除以 rss）
-        c_next = c_next / c_rss
+        c_next = c_next / (c_rss + c_rss.max() * 0.05)
         
         return c_next
 
