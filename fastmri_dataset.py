@@ -85,20 +85,38 @@ class JointFastMRIDataset(Dataset):
         # =========================================================================
         # 提前计算初始敏感度图 c_init_lowres (保留我们之前第二步的修复)
         # =========================================================================
+        # --- 替换为以下物理感知初始化逻辑 ---
         Nc, H, W = k_slice_norm.shape
-        cal_length = 32  
-        kspace_acs = torch.zeros_like(k_slice_norm)
+        cal_length = 32  # 保持你原来的 ACS 大小
         
+        # 1. 提取中心 ACS 块
         h_start, h_end = H // 2 - cal_length // 2, H // 2 + cal_length // 2
         w_start, w_end = W // 2 - cal_length // 2, W // 2 + cal_length // 2
-        kspace_acs[:, h_start:h_end, w_start:w_end] = k_slice_norm[:, h_start:h_end, w_start:w_end]
+        acs_block = k_slice_norm[:, h_start:h_end, w_start:w_end]
         
+        # 2. 生成二维汉宁窗 (消除硬截断导致的波浪伪影)
+        window_1d = torch.hann_window(cal_length, periodic=False, device=k_slice_norm.device)
+        window_2d = window_1d.unsqueeze(1) * window_1d.unsqueeze(0)
+        
+        # 3. 将窗函数应用到 ACS 块上并补回全零矩阵
+        kspace_acs = torch.zeros_like(k_slice_norm)
+        kspace_acs[:, h_start:h_end, w_start:w_end] = acs_block * window_2d
+        
+        # 4. 执行 IFFT 得到平滑的低频感应场
         img_low = torch.fft.ifftshift(kspace_acs, dim=(-2, -1))
         img_low = torch.fft.ifft2(img_low, norm="ortho")
         img_low = torch.fft.fftshift(img_low, dim=(-2, -1))
         
-        rss_low = torch.sqrt(torch.sum(torch.abs(img_low) ** 2, dim=0, keepdim=True) + 1e-8)
-        c_init_lowres = img_low / rss_low
+        # 5. 计算 RSS 并应用 Sigmoid 软掩膜 (消除空气区域噪声放大)
+        rss_low = torch.sqrt(torch.sum(torch.abs(img_low) ** 2, dim=0, keepdim=True))
+        
+        # 构建软掩膜: 仅在有信号区域 RSS 趋近 1，背景处趋近 0
+        rss_norm = rss_low / (rss_low.max() + 1e-8)
+        soft_mask = torch.sigmoid((rss_norm - 0.15) * 50)
+        
+        # 最终初始化结果：归一化并施加保护掩膜
+        c_init_lowres = (img_low / (rss_low + 1e-8)) * soft_mask
+        # ----------------------------------
 
         # =========================================================================
         # 使用最优线圈合并计算 u 的初始估计 (消除相位抵消)
