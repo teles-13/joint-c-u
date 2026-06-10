@@ -37,7 +37,7 @@ def main():
     dataloader = DataLoader(dataset, batch_size=1, shuffle=True, num_workers=4, pin_memory=True)
     
     model = VariationalNetwork(num_steps=10, num_filters=24).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=1e-4)
+    optimizer = optim.Adam(model.parameters(), lr=5e-5)
     
     num_epochs = 1000
     loss_hist, mse_hist, ssim_hist, psnr_hist = [], [], [], []
