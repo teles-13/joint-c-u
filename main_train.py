@@ -28,7 +28,7 @@ def center_crop(data, shape=(320, 320)):
 
 def main():
     print("====== 正在初始化盲联合重建 (Blind Joint Recon) ======")
-    data_dir = "/home/liujunda/data_fastmri_train"  
+    data_dir = "/home/liujunda/data_fastmri_brain_train/multicoil_train"  
     image_save_dir = 'recon_images'
     os.makedirs(image_save_dir, exist_ok=True)
     
