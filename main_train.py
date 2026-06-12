@@ -2,7 +2,17 @@ import matplotlib
 matplotlib.use('Agg')
 
 import os
+# 彻底限制隐式多线程，把 CPU 使用率封印在低水平
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+
 import torch
+# 主进程最多只分配 2 个核
+torch.set_num_threads(2)
+
 import torch.nn.functional as F
 import torch.optim as optim
 import numpy as np
@@ -16,7 +26,7 @@ from pisco_g_matrix import compute_G_for_fastmri_slice
 from networks import VariationalNetwork  
 
 # 锁定 GPU
-os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+os.environ["CUDA_VISIBLE_DEVICES"] = "2"
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 def center_crop(data, shape=(320, 320)):
@@ -26,6 +36,14 @@ def center_crop(data, shape=(320, 320)):
     w_start = (w - tw) // 2
     return data[..., h_start:h_start+th, w_start:w_start+tw]
 
+def worker_init_fn(worker_id):
+    import numpy as np
+    import torch
+    # 保证不同进程的数据增强/采样随机种子不同
+    np.random.seed(np.random.get_state()[1][0] + worker_id)
+    # 强制每个子进程只能使用 1 个 CPU 核
+    torch.set_num_threads(1)
+
 def main():
     print("====== 正在初始化盲联合重建 (Blind Joint Recon) ======")
     data_dir = "/home/liujunda/data_fastmri_brain_train/multicoil_train"  
@@ -34,7 +52,9 @@ def main():
     
     # 初始化数据集
     dataset = JointFastMRIDataset(data_dir=data_dir, target_shape=(16, 16, 640, 320), target_slice=7)
-    dataloader = DataLoader(dataset, batch_size=1, shuffle=True, num_workers=4, pin_memory=True)
+    dataloader = DataLoader(dataset, batch_size=1, shuffle=True, 
+                            num_workers=4, pin_memory=True, 
+                            worker_init_fn=worker_init_fn)
     
     model = VariationalNetwork(num_steps=10, num_filters=24).to(device)
     optimizer = optim.Adam(model.parameters(), lr=5e-5)
@@ -92,45 +112,38 @@ def main():
             target_mag = torch.abs(target_cropped)
             
             with torch.no_grad():
-                recon_mag_np = u_pred_mag.cpu().detach().numpy()
-                ref_mag_np = target_mag.cpu().numpy()  
+                # ✨ 直接在 GPU 上计算 MSE 和 PSNR（速度提升上百倍）
+                mse_gpu = torch.mean((target_mag - u_pred_mag) ** 2)
+                data_range_gpu = target_mag.max() - target_mag.min()
                 
-                batch_ssim_sum = 0.0
-                batch_psnr_sum = 0.0
-                actual_B = recon_mag_np.shape[0]
+                if mse_gpu == 0:
+                    val_psnr = 100.0
+                else:
+                    val_psnr = 20 * torch.log10(data_range_gpu / torch.sqrt(mse_gpu))
                 
-                for b in range(actual_B):
-                    recon_b = recon_mag_np[b, 0, :, :]
-                    ref_b = ref_mag_np[b, 0, :, :]
-                    data_range = ref_b.max() - ref_b.min()
-                    
-                    val_ssim = ssim_func(recon_b, ref_b, data_range=data_range, gaussian_weights=True, use_sample_covariance=False)
-                    batch_ssim_sum += val_ssim
-                    
-                    mse_val = np.mean((ref_b - recon_b) ** 2)
-                    val_psnr = 100.0 if mse_val == 0 else 20 * np.log10(data_range / np.sqrt(mse_val))
-                    batch_psnr_sum += val_psnr
-                
-                avg_batch_ssim = batch_ssim_sum / actual_B
-                avg_batch_psnr = batch_psnr_sum / actual_B
                 scaled_mse = loss.item() * 100
-                
                 epoch_loss += loss.item()
                 epoch_mse += scaled_mse
-                epoch_ssim += avg_batch_ssim
-                epoch_psnr += avg_batch_psnr
+                # 取标量值
+                epoch_psnr += val_psnr.item()
 
-                # 每 50 个 batch 画一次图
-                # 每 50 个 batch 画一次图
+                # 每 50 个 batch 画一次图，只有画图时才拉回 CPU 算一次 SSIM 供参考
                 if batch_idx == 0 or (batch_idx + 1) % 50 == 0:
+                    recon_mag_np = u_pred_mag.cpu().detach().numpy()
+                    ref_mag_np = target_mag.cpu().numpy()  
+                    
                     under_mag_img = center_crop(torch.abs(u_t), (320, 320)).cpu().detach().numpy()[0, 0]
                     recon_img = recon_mag_np[0, 0]
                     ref_img = ref_mag_np[0, 0]
                     
+                    # 在这里算一下 SSIM 即可，不要给每个 batch 都算
+                    val_ssim = ssim_func(recon_img, ref_img, data_range=ref_img.max() - ref_img.min(), gaussian_weights=True, use_sample_covariance=False)
+                    epoch_ssim += val_ssim # 用采样的 SSIM 代表整体即可
+                    
                     error_scale = 1.0
                     error_map = np.abs(ref_img - recon_img) * error_scale
                     
-                    # ✨ 新增：提取估计出的敏感度图 c，进行中心裁剪并取第 0 个通道（第一个线圈）
+                    # 提取估计出的敏感度图 c
                     c_final_cropped = center_crop(c_final, (320, 320))
                     c_img = torch.abs(c_final_cropped).cpu().detach().numpy()[0, 0]
                     
