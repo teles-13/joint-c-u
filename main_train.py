@@ -52,7 +52,7 @@ def main():
     os.makedirs(image_save_dir, exist_ok=True)
     
     
-    dataset = JointFastMRIDataset(data_dir=data_dir, target_shape=(16, 16, 640, 320), target_slice=None)
+    dataset = JointFastMRIDataset(data_dir=data_dir, target_shape=(16, 16, 640, 320), target_slice=7)
     dataloader = DataLoader(dataset, batch_size=1, shuffle=True, 
                             num_workers=4, pin_memory=True, 
                             worker_init_fn=worker_init_fn)
@@ -103,20 +103,18 @@ def main():
             u_pred_mag = torch.abs(u_pred)
             target_mag = torch.abs(target_cropped)
             
-            # ==========================================
-            # 修正 1：在复数域计算 Loss，防止相位崩塌
-            # ==========================================
+          
             u_pred_cropped = center_crop(u_pred_unprocessed, (320, 320))
             target_cropped_mag = center_crop(target, (320, 320))
-            u_t_cropped = center_crop(u_t, (320, 320))
 
-            # 提取物理上最合理的初始相位
-            target_phase = torch.angle(u_t_cropped)     
-            # 构造带有物理相位的复数 Target
-            target_complex = target_cropped_mag * torch.exp(1j * target_phase)
+            # 1. 直接计算预测复数图像的幅值
+            u_pred_mag_loss = torch.abs(u_pred_cropped)
+            
+            # 2. 确保 target_cropped_mag 也是纯幅值（FastMRI 标签本身就是幅值，求 abs 更稳健）
+            target_mag_loss = torch.abs(target_cropped_mag)
 
-            # 计算复数 MSE (等价于分别计算实部和虚部的 MSE)
-            loss = F.mse_loss(torch.view_as_real(u_pred_cropped), torch.view_as_real(target_complex))
+            # 3. 在纯实数幅值域计算均方误差
+            loss = F.mse_loss(u_pred_mag_loss, target_mag_loss)
             
             loss.backward()
             optimizer.step()
