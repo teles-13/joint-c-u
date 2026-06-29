@@ -46,14 +46,13 @@ def worker_init_fn(worker_id):
     torch.set_num_threads(1)
 
 def main():
-    print("====== 正在初始化盲联合重建 (Blind Joint Recon - 全 Volume 版) ======")
+    print("====== 正在初始化盲联合重建 (Blind Joint Recon) ======")
     data_dir = "/home/liujunda/data_fastmri_brain_train/multicoil_train"  
     image_save_dir = 'recon_images'
     os.makedirs(image_save_dir, exist_ok=True)
     
-    # 实例化全 Volume 数据集
-    dataset = JointFastMRIDataset(data_dir=data_dir, target_shape=(16, 16, 640, 320))
-    # 注意：batch_size=1 意味着每次读取 1 个完整的 Volume（内部自带 16 个切片作为网络的 Batch 维度）
+    
+    dataset = JointFastMRIDataset(data_dir=data_dir, target_shape=(16, 16, 640, 320), target_slice=None)
     dataloader = DataLoader(dataset, batch_size=1, shuffle=True, 
                             num_workers=4, pin_memory=True, 
                             worker_init_fn=worker_init_fn)
@@ -65,6 +64,9 @@ def main():
     num_epochs = 1000
     loss_hist, mse_hist, ssim_hist, psnr_hist = [], [], [], []
     
+    # ==========================================
+    # ✨ 新增：初始化用于记录网络权重的字典
+    # ==========================================
     weight_hist = {
         'alpha': {i: [] for i in range(num_steps)},
         'beta': {i: [] for i in range(num_steps)},
@@ -78,38 +80,42 @@ def main():
         num_batches = len(dataloader)
         
         for batch_idx, data_dict in enumerate(dataloader):
-            # 因为 DataLoader batch_size=1，所以多了一层多余的外面 Batch 维度，直接用 squeeze(0) 去掉它
-            # 从而把真正的切片维度释放出来，变为网络的 Batch 维度 B = num_slices
-            u_t = data_dict['u_t'].squeeze(0).to(device)                 # (B, H, W)
-            f_kspace = data_dict['f'].squeeze(0).to(device)              # (B, Nc, H, W)
-            mask = data_dict['sampling_mask'].squeeze(0).to(device)      # (H, W)
-            target = data_dict['reference'].squeeze(0).to(device)        # (B, H, W)
-            G_tensor_batch = data_dict['G_tensor'].squeeze(0).to(device) # (B, H, W, Nc, Nc)
-            c_init = data_dict['c_init'].squeeze(0).to(device)           # (B, Nc, H, W)
+            u_t = data_dict['u_t'].to(device)                 
+            f_kspace = data_dict['f'].to(device)              
+            mask = data_dict['sampling_mask'].to(device)      
+            target = data_dict['reference'].to(device)        
+            G_tensor_batch = data_dict['G_tensor'].to(device) 
+            c_init = data_dict['c_init'].to(device)
+            current_slice = data_dict['slice_idx'][0].item() 
             
-            B, Nc, H, W = f_kspace.shape # 此时 B 自动等于 16 (切片总数)
+            B, Nc, H, W = f_kspace.shape
             
-            # 为图像扩充通道维度，变成符合网络要求的 (B, 1, H, W)
-            u_t = u_t.unsqueeze(1) 
-            target = target.unsqueeze(1)
-            # 掩膜广播扩充为 (B, 1, H, W)
-            mask = mask.unsqueeze(0).unsqueeze(0).expand(B, 1, H, W)
+            if u_t.dim() == 3: u_t = u_t.unsqueeze(1) 
+            if target.dim() == 3: target = target.unsqueeze(1)
+            if mask.dim() == 3: mask = mask.unsqueeze(1)
             
             optimizer.zero_grad()
-            
-            # 核心网络前向传播：16个切片的数据作为一个矩阵同时输入，一次迭代更新所有切片的灵敏度 c_final 
             u_pred_unprocessed, c_final = model(f_kspace, mask, G_tensor_batch, u_t, c_init)
             
-            # 裁剪到目标视野
-            u_pred_cropped = center_crop(u_pred_unprocessed, (320, 320))
+            u_pred = center_crop(u_pred_unprocessed, (320, 320))
             target_cropped = center_crop(target, (320, 320))
+            
+            u_pred_mag = torch.abs(u_pred)
+            target_mag = torch.abs(target_cropped)
+            
+            # ==========================================
+            # 修正 1：在复数域计算 Loss，防止相位崩塌
+            # ==========================================
+            u_pred_cropped = center_crop(u_pred_unprocessed, (320, 320))
+            target_cropped_mag = center_crop(target, (320, 320))
             u_t_cropped = center_crop(u_t, (320, 320))
 
-            # 物理相位损失计算
+            # 提取物理上最合理的初始相位
             target_phase = torch.angle(u_t_cropped)     
-            target_complex = torch.abs(target_cropped) * torch.exp(1j * target_phase)
+            # 构造带有物理相位的复数 Target
+            target_complex = target_cropped_mag * torch.exp(1j * target_phase)
 
-            # 在复数域计算整个 Volume (16个切片) 的总平均 Loss
+            # 计算复数 MSE (等价于分别计算实部和虚部的 MSE)
             loss = F.mse_loss(torch.view_as_real(u_pred_cropped), torch.view_as_real(target_complex))
             
             loss.backward()
@@ -117,9 +123,11 @@ def main():
             
             # 指标计算与记录
             with torch.no_grad():
-                u_pred_mag = torch.abs(u_pred_cropped)
-                target_mag = torch.abs(target_cropped)
+                # 为了 torchmetrics，确保维度是 (B, C, H, W)
+                if target_mag.dim() == 3: target_mag = target_mag.unsqueeze(1)
+                if u_pred_mag.dim() == 3: u_pred_mag = u_pred_mag.unsqueeze(1)
 
+                # ✨ 直接在 GPU 上计算 MSE 和 PSNR
                 mse_gpu = torch.mean((target_mag - u_pred_mag) ** 2)
                 data_range_gpu = target_mag.max() - target_mag.min()
                 
@@ -128,25 +136,31 @@ def main():
                 else:
                     val_psnr = 20 * torch.log10(data_range_gpu / torch.sqrt(mse_gpu))
                 
+                # ✨ 新增：直接在 GPU 上计算 SSIM（每个 batch 都算）
                 val_ssim = ssim_func_pt(u_pred_mag, target_mag, data_range=data_range_gpu)
                 
+                # 记录指标 (⚠️ 注意这里去掉了 loss.item() * 100 的缩放，还原真实的 MSE)
                 epoch_loss += loss.item()
-                epoch_mse += mse_gpu.item()  
+                epoch_mse += mse_gpu.item()  # 修复：记录真实的物理 MSE
                 epoch_psnr += val_psnr.item()
-                epoch_ssim += val_ssim.item()
+                epoch_ssim += val_ssim.item() # 修复：每个 batch 都累加真实的 SSIM
 
-                # 每 50 个 batch 画图展示（我们默认抽取该 Volume 的中间切片进行可视化）
+                # 每 50 个 batch 画一次图
                 if batch_idx == 0 or (batch_idx + 1) % 50 == 0:
-                    mid_slice = B // 2  # 取中间那个切片
+                    recon_mag_np = u_pred_mag.cpu().detach().numpy()
+                    ref_mag_np = target_mag.cpu().numpy()  
                     
-                    under_mag_img = center_crop(torch.abs(u_t), (320, 320)).cpu().detach().numpy()[mid_slice, 0]
-                    recon_img = u_pred_mag.cpu().detach().numpy()[mid_slice, 0]
-                    ref_img = target_mag.cpu().numpy()[mid_slice, 0]
+                    under_mag_img = center_crop(torch.abs(u_t), (320, 320)).cpu().detach().numpy()[0, 0]
+                    recon_img = recon_mag_np[0, 0]
+                    ref_img = ref_mag_np[0, 0]
                     
-                    error_map = np.abs(ref_img - recon_img)
+                    # ⚠️ 注意：这里删除了原来计算 val_ssim 和累加 epoch_ssim 的代码，因为上面已经算过了
+                    
+                    error_scale = 1.0
+                    error_map = np.abs(ref_img - recon_img) * error_scale
                     
                     c_final_cropped = center_crop(c_final, (320, 320))
-                    c_img = torch.abs(c_final_cropped).cpu().detach().numpy()[mid_slice, 0] # 提取中间切片的第0个线圈
+                    c_img = torch.abs(c_final_cropped).cpu().detach().numpy()[0, 0]
                     
                     fig, axes = plt.subplots(1, 5, figsize=(20, 4))
                     axes[0].imshow(under_mag_img, cmap='gray')
@@ -165,7 +179,7 @@ def main():
                     axes[4].set_title("Estimated Smap (Coil 0)")
                     axes[4].axis('off')
                     
-                    plt.suptitle(f"Epoch {epoch+1} | Volume Batch {batch_idx+1} - Mid-Slice {mid_slice} Result")
+                    plt.suptitle(f"Epoch {epoch+1} | Batch {batch_idx+1} - Result (Slice {current_slice})")
                     plt.tight_layout()
                     plt.savefig(os.path.join(image_save_dir, f'recon_epoch_{epoch+1:03d}_batch_{batch_idx+1:04d}.png'), bbox_inches='tight')
                     plt.close()
