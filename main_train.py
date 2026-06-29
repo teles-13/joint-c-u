@@ -125,7 +125,7 @@ def main():
             target_input = target_norm.unsqueeze(0).unsqueeze(0) 
 
             optimizer.zero_grad()
-            u_pred_unprocessed, c_final = model(f_kspace_input, mask_input, G_tensor_batch, u_t, c_init)
+            u_pred_unprocessed, c_final, c_history = model(f_kspace_input, mask_input, G_tensor_batch, u_t, c_init)
             
             u_pred_cropped = center_crop(u_pred_unprocessed, (320, 320))
             target_cropped_mag = center_crop(target_input, (320, 320))
@@ -193,6 +193,29 @@ def main():
                     plt.tight_layout()
                     plt.savefig(os.path.join(image_save_dir, f'recon_epoch_{epoch+1:03d}_batch_{batch_idx+1:04d}.png'), bbox_inches='tight')
                     plt.close()
+
+                    fig_c, axes_c = plt.subplots(4, 5, figsize=(20, 16))
+                    axes_c = axes_c.flatten() # 展平一维，方便用 for 循环遍历
+                    
+                    for step_idx in range(num_steps):
+                        # 提取第 step_idx 层的敏感度图
+                        c_step_tensor = c_history[step_idx]
+                        c_step_cropped = center_crop(c_step_tensor, (320, 320))
+                        
+                        # 取出当前层 Coil 0 的幅值图，转到 CPU 上变 numpy
+                        c_step_img = torch.abs(c_step_cropped).cpu().detach().numpy()[0, 0]
+                        
+                        # 画在对应的格子里
+                        axes_c[step_idx].imshow(c_step_img, cmap='gray')
+                        axes_c[step_idx].set_title(f"Step {step_idx + 1}")
+                        axes_c[step_idx].axis('off')
+                        
+                    plt.suptitle(f"Epoch {epoch+1} | Batch {batch_idx+1} - Smap Evolution (Coil 0)", fontsize=20)
+                    plt.tight_layout()
+                    
+                    # 额外保存为一张新图片
+                    plt.savefig(os.path.join(image_save_dir, f'smap_evolution_epoch_{epoch+1:03d}_batch_{batch_idx+1:04d}.png'), bbox_inches='tight')
+                    plt.close(fig_c)
 
         with torch.no_grad():
             for step_idx in range(num_steps):
