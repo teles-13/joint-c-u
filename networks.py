@@ -64,33 +64,33 @@ class VNSensitivityBlock(nn.Module):
     def __init__(self):
         super().__init__()
         self.beta_step = nn.Parameter(torch.tensor(-1.0, dtype=torch.float32))  
-        self.lambda_reg = nn.Parameter(torch.tensor(0.1, dtype=torch.float32)) 
+        self.lambda_reg = nn.Parameter(torch.tensor(-3.0, dtype=torch.float32)) 
 
     # ⚠️ 彻底修复：参数签名去掉了 lamb 和 beta
     def forward(self, c_k, u_next, f_kspace, mask, G_tensor):
         ops = MRPhysicsOperators()
-        # 在内部动态计算参数
+        
         beta = F.softplus(self.beta_step)
         lamb = F.softplus(self.lambda_reg)
 
+        # 1. 计算数据保真项梯度
         c_times_u_next = c_k * u_next
         k_pred_next = ops.fft2c(c_times_u_next)
         residual_img_next = ops.ifft2c(mask * (k_pred_next - f_kspace)) 
         grad_c_fidelity = torch.conj(u_next) * residual_img_next 
 
+        # 2. 计算物理先验项梯度
         grad_c_prior = lamb * torch.einsum('bhwij, bjhw -> bihw', G_tensor, c_k)
+
+        # 3. 联合更新 c
         c_next = c_k - beta * (grad_c_fidelity + grad_c_prior)
         
-        # ⚠️ 彻底修复：纯净物理投影，不要加 0.05 干扰
+        # ==========================================================
+        # ✨ 紧急修复：只保留绝对纯净的 RSS=1 物理投影
+        # 删掉所有跟 periodic_window 和 pad_h/pad_w 相关的代码！
+        # ==========================================================
         c_rss = torch.sqrt(torch.sum(torch.abs(c_next)**2, dim=1, keepdim=True) + 1e-8)
         c_next = c_next / c_rss
-        
-        # ✨ 平滑边界，物理消除 FFT 振荡波纹
-        b, nc, h, w = c_next.shape
-        pad_w = torch.hann_window(w, periodic=True, device=c_next.device).view(1, 1, 1, w)
-        pad_h = torch.hann_window(h, periodic=True, device=c_next.device).view(1, 1, h, 1)
-        periodic_window = pad_h * pad_w
-        c_next = c_next * periodic_window
         
         return c_next
 
@@ -103,7 +103,16 @@ class VariationalNetwork(nn.Module):
     def forward(self, f_kspace, mask, G_tensor, u_init, c_init):
         u_k = u_init
         c_k = c_init
+        
+        # ✨ 1. 新增：创建一个空列表记录迭代历史
+        c_history = []
+        
         for u_block, c_block in zip(self.u_blocks, self.c_blocks):
             u_k = u_block(u_k, c_k, f_kspace, mask)
             c_k = c_block(c_k, u_k, f_kspace, mask, G_tensor)
-        return u_k, c_k
+            
+            # ✨ 2. 新增：将当前这一层的 C 存入列表
+            c_history.append(c_k)
+            
+        # ✨ 3. 修改：返回时带上这个历史记录
+        return u_k, c_k, c_history
