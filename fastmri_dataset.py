@@ -37,7 +37,7 @@ class JointFastMRIDataset(Dataset):
                         self.volume_norms[f_path] = paper_norm
                         
                         for s_idx in range(num_slices):
-                            if s_idx == self.target_slice:  
+                            if self.target_slice is None or s_idx == self.target_slice:
                                 self.slice_indices.append((f_path, s_idx))
             except Exception as e:
                 pass
