@@ -59,14 +59,11 @@ class JointFastMRIDataset(Dataset):
         return len(self.slice_indices)
 
     def __getitem__(self, idx):
-        f_path = self.valid_files[idx]
+        f_path, s_idx = self.slice_indices[idx]
 
         with h5py.File(f_path, 'r') as f_orig:
-            # 1. 仅读取第 8 个切片（索引为 7）
-            # kspace 原始形状: (num_slices, Nc, H, W) -> 抽取后: (Nc, H, W)
-            k_slice = torch.tensor(f_orig['kspace'][7], dtype=torch.complex64)
-            # reconstruction_rss 原始形状: (num_slices, H, W) -> 抽取后: (H, W)
-            target_slice = torch.tensor(f_orig['reconstruction_rss'][7], dtype=torch.float32) 
+            k_slice = torch.tensor(f_orig['kspace'][s_idx], dtype=torch.complex64)
+            target_slice = torch.tensor(f_orig['reconstruction_rss'][s_idx], dtype=torch.float32)
 
         Nc, H, W = k_slice.shape
         
@@ -106,6 +103,13 @@ class JointFastMRIDataset(Dataset):
         
         c_init_volume = (img_low / (rss_low + 1e-8)) * soft_mask  # (Nc, H, W)
         
+        pad_w = torch.hann_window(W, periodic=True, device=c_init_volume.device).view(1, 1, W)
+        pad_h = torch.hann_window(H, periodic=True, device=c_init_volume.device).view(1, H, 1)
+        # 融合为全图的二维周期平滑权重
+        periodic_window = pad_h * pad_w
+        # 作用于初始化 Smap
+        c_init_volume = c_init_volume * periodic_window 
+
         # --- 计算该切片的 G_tensor ---
         G_tensor_volume = compute_G_for_fastmri_slice(k_slice_norm.numpy(), cal_length=32) # (H, W, Nc, Nc)
 
@@ -122,6 +126,7 @@ class JointFastMRIDataset(Dataset):
             'sampling_mask': mask_2d.real.to(torch.float32),        # (H, W)
             'reference': target_norm,                               # (H, W)
             'G_tensor': G_tensor_volume,                            # (H, W, Nc, Nc)
-            'c_init': c_init_volume,                                # (Nc, H, W)
+            'c_init': c_init_volume,      
+            'slice_idx': s_idx,                          # (Nc, H, W)
             'vol_path': f_path
         }
