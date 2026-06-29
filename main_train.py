@@ -1,8 +1,6 @@
 import matplotlib
 matplotlib.use('Agg')
-
 import os
-# 彻底限制隐式多线程，把 CPU 使用率封印在低水平
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
@@ -10,9 +8,7 @@ os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
 os.environ["NUMEXPR_NUM_THREADS"] = "1"
 
 import torch
-# 主进程最多只分配 2 个核
 torch.set_num_threads(2)
-
 import torch.nn.functional as F
 import torch.optim as optim
 import numpy as np
@@ -21,12 +17,10 @@ from torch.utils.data import DataLoader
 from skimage.metrics import structural_similarity as ssim_func
 from torchmetrics.functional import structural_similarity_index_measure as ssim_func_pt
 
-# 导入你写好的各个模块
 from fastmri_dataset import JointFastMRIDataset 
 from pisco_g_matrix import compute_G_for_fastmri_slice
 from networks import VariationalNetwork  
 
-# 锁定 GPU
 os.environ["CUDA_VISIBLE_DEVICES"] = "3"
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
@@ -40,9 +34,7 @@ def center_crop(data, shape=(320, 320)):
 def worker_init_fn(worker_id):
     import numpy as np
     import torch
-    # 保证不同进程的数据增强/采样随机种子不同
     np.random.seed(np.random.get_state()[1][0] + worker_id)
-    # 强制每个子进程只能使用 1 个 CPU 核
     torch.set_num_threads(1)
 
 def main():
@@ -51,7 +43,7 @@ def main():
     image_save_dir = 'recon_images'
     os.makedirs(image_save_dir, exist_ok=True)
     
-    
+    # ⚠️ 确保聚焦第七个切片
     dataset = JointFastMRIDataset(data_dir=data_dir, target_shape=(16, 16, 640, 320), target_slice=7)
     dataloader = DataLoader(dataset, batch_size=1, shuffle=True, 
                             num_workers=4, pin_memory=True, 
@@ -64,9 +56,6 @@ def main():
     num_epochs = 1000
     loss_hist, mse_hist, ssim_hist, psnr_hist = [], [], [], []
     
-    # ==========================================
-    # ✨ 新增：初始化用于记录网络权重的字典
-    # ==========================================
     weight_hist = {
         'alpha': {i: [] for i in range(num_steps)},
         'beta': {i: [] for i in range(num_steps)},
@@ -80,52 +69,81 @@ def main():
         num_batches = len(dataloader)
         
         for batch_idx, data_dict in enumerate(dataloader):
-            u_t = data_dict['u_t'].to(device)                 
-            f_kspace = data_dict['f'].to(device)              
-            mask = data_dict['sampling_mask'].to(device)      
-            target = data_dict['reference'].to(device)        
-            G_tensor_batch = data_dict['G_tensor'].to(device) 
-            c_init = data_dict['c_init'].to(device)
-            current_slice = data_dict['slice_idx'][0].item() 
+            # 1. 纯数据直接丢入 GPU
+            k_slice = data_dict['k_slice'].squeeze(0).to(device)       
+            target_slice = data_dict['target_slice'].squeeze(0).to(device) 
+            mask_2d = data_dict['sampling_mask'].squeeze(0).to(device) 
+            current_slice = data_dict['slice_idx'][0].item()
             
-            B, Nc, H, W = f_kspace.shape
+            Nc, H, W = k_slice.shape
             
-            if u_t.dim() == 3: u_t = u_t.unsqueeze(1) 
-            if target.dim() == 3: target = target.unsqueeze(1)
-            if mask.dim() == 3: mask = mask.unsqueeze(1)
+            # 2. 欠采样与幅度值归一化 (GPU)
+            f_kspace = k_slice * mask_2d
+            target_max = torch.max(torch.abs(target_slice)) + 1e-8
+            scale_factor = 1.0 / target_max
             
+            f_norm = f_kspace * scale_factor
+            k_slice_norm = k_slice * scale_factor
+            target_norm = target_slice * scale_factor
+
+            # 3. G Tensor (利用主进程单线程 NumPy 飞速解算 32x32，绝不死锁)
+            k_slice_norm_np = k_slice_norm.cpu().numpy()
+            G_tensor_slice = compute_G_for_fastmri_slice(k_slice_norm_np, cal_length=32)
+            G_tensor_batch = G_tensor_slice.unsqueeze(0).to(device)
+
+            # 4. 物理感知 Smap 初始化 (全 GPU 并行傅里叶)
+            cal_length = 32
+            h_start, h_end = H // 2 - cal_length // 2, H // 2 + cal_length // 2
+            w_start, w_end = W // 2 - cal_length // 2, W // 2 + cal_length // 2
+            
+            window_1d = torch.hann_window(cal_length, periodic=False, device=device)
+            window_2d = window_1d.unsqueeze(1) * window_1d.unsqueeze(0)
+
+            acs_block = k_slice_norm[:, h_start:h_end, w_start:w_end]
+            kspace_acs = torch.zeros_like(k_slice_norm)
+            kspace_acs[:, h_start:h_end, w_start:w_end] = acs_block * window_2d
+            
+            img_low = torch.fft.ifftshift(kspace_acs, dim=(-2, -1))
+            img_low = torch.fft.ifft2(img_low, norm="ortho")
+            img_low = torch.fft.fftshift(img_low, dim=(-2, -1))
+            
+            rss_low = torch.sqrt(torch.sum(torch.abs(img_low) ** 2, dim=0, keepdim=True))
+            rss_norm = rss_low / (rss_low.max() + 1e-8)
+            soft_mask = torch.sigmoid((rss_norm - 0.15) * 50)
+            c_init_slice = (img_low / (rss_low + 1e-8)) * soft_mask
+            c_init = c_init_slice.unsqueeze(0) 
+
+            # 5. u 初始化 (GPU)
+            Finv = torch.fft.ifftshift(f_norm, dim=(-2, -1))
+            Finv = torch.fft.ifft2(Finv, norm="ortho")
+            Finv = torch.fft.fftshift(Finv, dim=(-2, -1))
+            u_t = torch.sum(Finv * torch.conj(c_init_slice), dim=0).unsqueeze(0).unsqueeze(0)
+
+            # 6. 配置网络张量尺寸 (B, C, H, W)
+            f_kspace_input = f_norm.unsqueeze(0)             
+            mask_input = mask_2d.unsqueeze(0).unsqueeze(0)   
+            target_input = target_norm.unsqueeze(0).unsqueeze(0) 
+
             optimizer.zero_grad()
-            u_pred_unprocessed, c_final = model(f_kspace, mask, G_tensor_batch, u_t, c_init)
+            u_pred_unprocessed, c_final = model(f_kspace_input, mask_input, G_tensor_batch, u_t, c_init)
             
-            u_pred = center_crop(u_pred_unprocessed, (320, 320))
-            target_cropped = center_crop(target, (320, 320))
-            
-            u_pred_mag = torch.abs(u_pred)
-            target_mag = torch.abs(target_cropped)
-            
-          
             u_pred_cropped = center_crop(u_pred_unprocessed, (320, 320))
-            target_cropped_mag = center_crop(target, (320, 320))
-
-            # 1. 直接计算预测复数图像的幅值
-            u_pred_mag_loss = torch.abs(u_pred_cropped)
+            target_cropped_mag = center_crop(target_input, (320, 320))
             
-            # 2. 确保 target_cropped_mag 也是纯幅值（FastMRI 标签本身就是幅值，求 abs 更稳健）
+            # ✨ 彻底修正：使用纯幅度 MSE Loss 解耦，完全切断波纹来源
+            u_pred_mag_loss = torch.abs(u_pred_cropped)
             target_mag_loss = torch.abs(target_cropped_mag)
-
-            # 3. 在纯实数幅值域计算均方误差
+            
             loss = F.mse_loss(u_pred_mag_loss, target_mag_loss)
             
             loss.backward()
             optimizer.step()
             
-            # 指标计算与记录
+            # 评价指标
             with torch.no_grad():
-                # 为了 torchmetrics，确保维度是 (B, C, H, W)
-                if target_mag.dim() == 3: target_mag = target_mag.unsqueeze(1)
-                if u_pred_mag.dim() == 3: u_pred_mag = u_pred_mag.unsqueeze(1)
+                u_pred_mag = torch.abs(center_crop(u_pred_unprocessed, (320, 320)))
+                target_mag = torch.abs(center_crop(target_input, (320, 320)))
 
-                # ✨ 直接在 GPU 上计算 MSE 和 PSNR
                 mse_gpu = torch.mean((target_mag - u_pred_mag) ** 2)
                 data_range_gpu = target_mag.max() - target_mag.min()
                 
@@ -134,16 +152,13 @@ def main():
                 else:
                     val_psnr = 20 * torch.log10(data_range_gpu / torch.sqrt(mse_gpu))
                 
-                # ✨ 新增：直接在 GPU 上计算 SSIM（每个 batch 都算）
                 val_ssim = ssim_func_pt(u_pred_mag, target_mag, data_range=data_range_gpu)
                 
-                # 记录指标 (⚠️ 注意这里去掉了 loss.item() * 100 的缩放，还原真实的 MSE)
                 epoch_loss += loss.item()
-                epoch_mse += mse_gpu.item()  # 修复：记录真实的物理 MSE
+                epoch_mse += mse_gpu.item()  
                 epoch_psnr += val_psnr.item()
-                epoch_ssim += val_ssim.item() # 修复：每个 batch 都累加真实的 SSIM
+                epoch_ssim += val_ssim.item() 
 
-                # 每 50 个 batch 画一次图
                 if batch_idx == 0 or (batch_idx + 1) % 50 == 0:
                     recon_mag_np = u_pred_mag.cpu().detach().numpy()
                     ref_mag_np = target_mag.cpu().numpy()  
@@ -152,10 +167,7 @@ def main():
                     recon_img = recon_mag_np[0, 0]
                     ref_img = ref_mag_np[0, 0]
                     
-                    # ⚠️ 注意：这里删除了原来计算 val_ssim 和累加 epoch_ssim 的代码，因为上面已经算过了
-                    
-                    error_scale = 1.0
-                    error_map = np.abs(ref_img - recon_img) * error_scale
+                    error_map = np.abs(ref_img - recon_img)
                     
                     c_final_cropped = center_crop(c_final, (320, 320))
                     c_img = torch.abs(c_final_cropped).cpu().detach().numpy()[0, 0]
@@ -182,14 +194,9 @@ def main():
                     plt.savefig(os.path.join(image_save_dir, f'recon_epoch_{epoch+1:03d}_batch_{batch_idx+1:04d}.png'), bbox_inches='tight')
                     plt.close()
 
-        # ==========================================
-        # ✨ 新增：在每个 Epoch 结束时记录模型权重并画图
-        # ==========================================
         with torch.no_grad():
             for step_idx in range(num_steps):
-                # 提取 alpha (VNImageBlock)
                 alpha_val = model.u_blocks[step_idx].alpha_step.item()
-                # 提取 beta 和 lambda (VNSensitivityBlock)，并套用真实前向传播使用的 softplus
                 beta_val = F.softplus(model.c_blocks[step_idx].beta_step).item()
                 lambda_val = F.softplus(model.c_blocks[step_idx].lambda_reg).item()
                 
@@ -197,10 +204,7 @@ def main():
                 weight_hist['beta'][step_idx].append(beta_val)
                 weight_hist['lambda'][step_idx].append(lambda_val)
 
-        # 绘制权重演变曲线
         fig_w, (ax_alpha, ax_beta, ax_lambda) = plt.subplots(1, 3, figsize=(20, 5))
-        
-        # 使用 cmap 渐变色区分不同的级联层
         colors = plt.cm.plasma(np.linspace(0, 1, num_steps))
         
         for step_idx in range(num_steps):
@@ -208,24 +212,16 @@ def main():
             ax_beta.plot(weight_hist['beta'][step_idx], color=colors[step_idx], label=f'Step {step_idx+1}')
             ax_lambda.plot(weight_hist['lambda'][step_idx], color=colors[step_idx], label=f'Step {step_idx+1}')
             
-        ax_alpha.set_title("Alpha (Image Block Step Size)")
-        ax_alpha.set_xlabel("Epoch")
+        ax_alpha.set_title("Alpha (Image Block)")
         ax_alpha.legend(fontsize='small', ncol=2)
-        
-        ax_beta.set_title("Beta (Smap Block Step Size) [Effective]")
-        ax_beta.set_xlabel("Epoch")
+        ax_beta.set_title("Beta (Smap Block)")
         ax_beta.legend(fontsize='small', ncol=2)
-        
-        ax_lambda.set_title("Lambda (G-Matrix Prior Weight) [Effective]")
-        ax_lambda.set_xlabel("Epoch")
+        ax_lambda.set_title("Lambda (G-Matrix Prior)")
         ax_lambda.legend(fontsize='small', ncol=2)
-        
         plt.tight_layout()
         plt.savefig('learned_parameters_curves.png')
         plt.close(fig_w)
-        # ==========================================
 
-        # Epoch 总结与保存
         avg_epoch_loss = epoch_loss / num_batches
         avg_epoch_ssim = epoch_ssim / num_batches
         avg_epoch_psnr = epoch_psnr / num_batches
@@ -237,7 +233,6 @@ def main():
 
         print(f"Epoch [{epoch+1}/{num_epochs}] | Loss: {avg_epoch_loss:.6f} | SSIM: {avg_epoch_ssim:.4f} | PSNR: {avg_epoch_psnr:.2f} dB")
 
-        # 绘制训练曲线
         fig, (ax1, ax2, ax3, ax4) = plt.subplots(1, 4, figsize=(24, 5))
         ax1.plot(loss_hist, color='green')
         ax1.set_title("Training Loss")
@@ -253,7 +248,6 @@ def main():
         plt.savefig('current_training_curves.png')
         plt.close(fig) 
 
-    # 保存模型
     os.makedirs('saved_models', exist_ok=True)
     model_save_path = 'saved_models/joint_blind_vn.pth' 
     torch.save(model.state_dict(), model_save_path)
