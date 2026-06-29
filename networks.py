@@ -49,7 +49,7 @@ class VNImageBlock(nn.Module):
         self.feature_extractor = nn.Sequential(*blocks)
         self.final_conv = spectral_norm(nn.Conv2d(num_filters, 2, kernel_size=3, padding=1)) 
         
-        self.radius = 2.0 # 论文指定的投影半径 r=1 [cite: 479]
+        self.radius = 1.0 # 论文指定的投影半径 r=1 [cite: 479]
 
     def forward(self, u_k, c_k, f_kspace, mask):
         ops = MRPhysicsOperators()
@@ -90,7 +90,7 @@ class VNSensitivityBlock(nn.Module):
         # ✨ 第四步核心修改：提升 G 矩阵先验的初始话语权 ✨
         # 将 -1.0 改为 1.0。经过 softplus 后初始权重约为 1.31。
         # 这确保了在训练初期，G 矩阵能以强势的物理规则引导敏感度图的走向，防止其胡乱更新
-        self.lambda_reg = nn.Parameter(torch.tensor(1.5, dtype=torch.float32)) 
+        self.lambda_reg = nn.Parameter(torch.tensor(0.1, dtype=torch.float32)) 
 
     def forward(self, c_k, u_next, f_kspace, mask, G_tensor):
         ops = MRPhysicsOperators()
@@ -117,9 +117,9 @@ class VNSensitivityBlock(nn.Module):
         # ==========================================
         # 计算当前各通道的平方和的算术平方根 (Root Sum of Squares)
         c_rss = torch.sqrt(torch.sum(torch.abs(c_next)**2, dim=1, keepdim=True) + 1e-8)
-        # 直接除以 c_rss 即可，保证每个像素上的敏感度平方和严格为 1
-        c_next = c_next / c_rss
         
+        # 强行将 C 投影到物理流形上（除以 rss）
+        c_next = c_next / (c_rss + c_rss.max() * 0.05)
         
         return c_next
 
