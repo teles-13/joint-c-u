@@ -92,35 +92,47 @@ class VNSensitivityBlock(nn.Module):
         # 这确保了在训练初期，G 矩阵能以强势的物理规则引导敏感度图的走向，防止其胡乱更新
         self.lambda_reg = nn.Parameter(torch.tensor(0.1, dtype=torch.float32)) 
 
-    def forward(self, c_k, u_next, f_kspace, mask, G_tensor):
-        ops = MRPhysicsOperators()
-        beta = F.softplus(self.beta_step)
-        lamb = F.softplus(self.lambda_reg)
-
-        # 1. 计算保真项梯度
+    def forward(self, c_k, u_next, f_kspace, mask, G_tensor, lamb, beta):
+        """
+        c_k: (b, nc, h, w)
+        u_next: (b, 1, h, w)
+        f_kspace: (b, nc, h, w)
+        mask: (b, 1, h, w)
+        G_tensor: (b, h, w, nc, nc)
+        """
+        # 1. 计算数据保真项梯度
         c_times_u_next = c_k * u_next
-        k_pred_next = ops.fft2c(c_times_u_next)
-        residual_img_next = ops.ifft2c(mask * (k_pred_next - f_kspace)) 
-        grad_c_fidelity = torch.conj(u_next) * residual_img_next 
+        k_pred_next = fft2c(c_times_u_next)
+        residual_img_next = ifft2c(mask * (k_pred_next - f_kspace))
+        grad_c_fidelity = torch.conj(u_next) * residual_img_next
 
-        # 2. 计算你的物理约束梯度 (\lambda H^H H c) 
-        # 神级 einsum：直接完成 (B, H, W, Nc, Nc) 与 (B, Nc, H, W) 的通道矩阵乘法
+        # 2. 计算物理先验项梯度
         grad_c_prior = lamb * torch.einsum('bhwij, bjhw -> bihw', G_tensor, c_k)
 
-        # 3. 联合更新 c
-        # 3. 联合更新 c
+        # 3. 梯度下降更新
         c_next = c_k - beta * (grad_c_fidelity + grad_c_prior)
-        
-        # ==========================================
-        # ✨ 第一步核心修改：显式物理归一化 (RSS = 1) ✨
-        # 目的：打破 C * u 的尺度歧义，防止 C 坍缩为 0，逼迫网络去学真实的 u
-        # ==========================================
-        # 计算当前各通道的平方和的算术平方根 (Root Sum of Squares)
+
+        # 4. 严格投影回 RSS=1 的物理流形
         c_rss = torch.sqrt(torch.sum(torch.abs(c_next)**2, dim=1, keepdim=True) + 1e-8)
+        c_next = c_next / c_rss
+
+        # ==========================================================
+        # ✨ 新增：空间域周期边界平滑投影（彻底杜绝边缘波纹往中心扩散）
+        # ==========================================================
+        b, nc, h, w = c_next.shape
         
-        # 强行将 C 投影到物理流形上（除以 rss）
-        c_next = c_next / (c_rss + c_rss.max() * 0.05)
+        # 为当前 batch 动态生成 H 和 W 维度的汉宁窗
+        # periodic=True 保证边界平滑过渡
+        pad_w = torch.hann_window(w, periodic=True, device=c_next.device).view(1, 1, 1, w)
+        pad_h = torch.hann_window(h, periodic=True, device=c_next.device).view(1, 1, h, 1)
         
+        # 结合成全图的二维周期平滑权重矩阵 (1, 1, H, W)，利用广播机制作用于所有 Batch 和 Channel
+        periodic_window = pad_h * pad_w
+        
+        # 将边界处的敏感度强制平滑收敛至 0
+        c_next = c_next * periodic_window
+        # ==========================================================
+
         return c_next
 
 # ==========================================
