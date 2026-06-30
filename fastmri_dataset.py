@@ -51,7 +51,7 @@ class JointFastMRIDataset(Dataset):
 
         mask_2d = self.fixed_mask.squeeze(0).squeeze(0)
         
-        # ⚠️ 纯粹的数据读写，没有卡脖子的计算
+      
         return {
             'k_slice': k_slice,
             'target_slice': target_slice,
