@@ -98,15 +98,21 @@ def G_matrices(kCal, N1, N2, tau, U, kernel_shape):
 
     G = G_flat.reshape(total_size, total_size, Nc, Nc, order='F')  
     
-    # 采用 FFT Interpolation 扩展到全图大小 (N1, N2)
     N1_g, N2_g = N1, N2 
-    n1 = np.fft.fftshift(np.fft.fftfreq(N1_g))
-    n2 = np.fft.fftshift(np.fft.fftfreq(N2_g))
+    # 1. 必须使用 unshifted 的频率，对齐 IFFT 的标准输出顺序
+    n1 = np.fft.fftfreq(N1_g)
+    n2 = np.fft.fftfreq(N2_g)
     n2, n1 = np.meshgrid(n2, n1, indexing='xy')
+    
+    # 相位核不变，但此时输入的 n1, n2 已经是正确对齐的了
     phaseKernel = np.exp(-1j * 2 * np.pi * (n1 * (N1_g - 2*tau - 1) + n2 * (N2_g - 2*tau - 1)))
     
-    G = np.fft.fft2(np.conj(G), s=(N1_g, N2_g), axes=(0,1), norm='ortho') * phaseKernel[:, :, np.newaxis, np.newaxis]
+    # 2. 必须去掉 np.conj，并使用 ifft2 匹配从频域到空间域的正向复指数映射
+    G = np.fft.ifft2(G, s=(N1_g, N2_g), axes=(0,1)) * phaseKernel[:, :, np.newaxis, np.newaxis]
+    
+    # 3. 最后再将空间图像居中
     G = np.fft.fftshift(G, axes=(0,1))
+    # --- 修正结束 ---
     
     return G
 
