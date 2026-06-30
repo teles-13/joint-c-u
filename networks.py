@@ -86,33 +86,47 @@ class VNSensitivityBlock(nn.Module):
         c_next = c_k - beta * (grad_c_fidelity + grad_c_prior)
         
         # ==========================================================
-        # ✨ 紧急修复：只保留绝对纯净的 RSS=1 物理投影
-        # 删掉所有跟 periodic_window 和 pad_h/pad_w 相关的代码！
+        # 删除软掩膜 (Soft Mask) 的计算，恢复纯粹的 RSS 归一化
         # ==========================================================
         c_rss = torch.sqrt(torch.sum(torch.abs(c_next)**2, dim=1, keepdim=True) + 1e-8)
         c_next = c_next / c_rss
         
         return c_next
-
+    
 class VariationalNetwork(nn.Module):
-    def __init__(self, num_steps=10, num_filters=24):
+    # ✨ 新增参数 inner_c_steps=10
+    def __init__(self, num_steps=20, num_filters=24, inner_c_steps=10):
         super().__init__()
+        self.num_steps = num_steps
+        self.inner_c_steps = inner_c_steps
+        
+        # u 的更新次数不变：num_steps 个 block
         self.u_blocks = nn.ModuleList([VNImageBlock(num_filters) for _ in range(num_steps)])
-        self.c_blocks = nn.ModuleList([VNSensitivityBlock() for _ in range(num_steps)])
+        
+        # ⚠️ C 的更新次数暴增：需要 num_steps * inner_c_steps 个独立 block
+        self.c_blocks = nn.ModuleList([VNSensitivityBlock() for _ in range(num_steps * inner_c_steps)])
 
     def forward(self, f_kspace, mask, G_tensor, u_init, c_init):
         u_k = u_init
         c_k = c_init
         
-        # ✨ 1. 新增：创建一个空列表记录迭代历史
         c_history = []
+        c_block_idx = 0  # 追踪当前调用到了第几个 C_block
         
-        for u_block, c_block in zip(self.u_blocks, self.c_blocks):
-            u_k = u_block(u_k, c_k, f_kspace, mask)
-            c_k = c_block(c_k, u_k, f_kspace, mask, G_tensor)
+        # 外层交替优化
+        for i in range(self.num_steps):
+            u_block = self.u_blocks[i]
             
-            # ✨ 2. 新增：将当前这一层的 C 存入列表
+            # 1. 内部循环：C 先利用当前的 u_k 连续梯度下降 10 次
+            for j in range(self.inner_c_steps):
+                c_block = self.c_blocks[c_block_idx]
+                c_k = c_block(c_k, u_k, f_kspace, mask, G_tensor)
+                c_block_idx += 1
+            
+            # 记录这 10 次下降结束后的 C，用作绘图历史
             c_history.append(c_k)
             
-        # ✨ 3. 修改：返回时带上这个历史记录
+            # 2. u 更新：利用刚才深度优化了 10 次的最新 C，对 u 优化 1 次
+            u_k = u_block(u_k, c_k, f_kspace, mask)
+            
         return u_k, c_k, c_history
