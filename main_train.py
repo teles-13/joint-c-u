@@ -49,8 +49,8 @@ def main():
                             num_workers=4, pin_memory=True, 
                             worker_init_fn=worker_init_fn)
     
-    num_steps = 20
-    model = VariationalNetwork(num_steps=num_steps, num_filters=24).to(device)
+    num_steps = 10
+    model = VariationalNetwork(num_steps=num_steps, num_filters=24, inner_c_steps=10).to(device)
     optimizer = optim.Adam(model.parameters(), lr=5e-5)
     
     num_epochs = 1000
@@ -130,7 +130,7 @@ def main():
             u_pred_cropped = center_crop(u_pred_unprocessed, (320, 320))
             target_cropped_mag = center_crop(target_input, (320, 320))
             
-            # ✨ 彻底修正：使用纯幅度 MSE Loss 解耦，完全切断波纹来源
+            
             u_pred_mag_loss = torch.abs(u_pred_cropped)
             target_mag_loss = torch.abs(target_cropped_mag)
             
@@ -217,11 +217,16 @@ def main():
                     plt.savefig(os.path.join(image_save_dir, f'smap_evolution_epoch_{epoch+1:03d}_batch_{batch_idx+1:04d}.png'), bbox_inches='tight')
                     plt.close(fig_c)
 
+        # 记录参数时，修改为如下逻辑
         with torch.no_grad():
             for step_idx in range(num_steps):
                 alpha_val = model.u_blocks[step_idx].alpha_step.item()
-                beta_val = F.softplus(model.c_blocks[step_idx].beta_step).item()
-                lambda_val = F.softplus(model.c_blocks[step_idx].lambda_reg).item()
+                
+                # ✨ 计算当前大步中，C 的最后一个内层 block 的索引
+                last_c_idx = step_idx * model.inner_c_steps + (model.inner_c_steps - 1)
+                
+                beta_val = F.softplus(model.c_blocks[last_c_idx].beta_step).item()
+                lambda_val = F.softplus(model.c_blocks[last_c_idx].lambda_reg).item()
                 
                 weight_hist['alpha'][step_idx].append(alpha_val)
                 weight_hist['beta'][step_idx].append(beta_val)
