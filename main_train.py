@@ -86,9 +86,8 @@ def main():
             target_norm = target_slice * scale_factor
 
             # 3. G Tensor (利用主进程单线程 NumPy 飞速解算 32x32，绝不死锁)
-            k_slice_norm_np = k_slice_norm.cpu().numpy()
-            G_tensor_slice = compute_G_for_fastmri_slice(k_slice_norm_np, cal_length=32)
-            G_tensor_batch = G_tensor_slice.unsqueeze(0).to(device)
+            G_tensor_slice = compute_G_for_fastmri_slice(k_slice_norm, cal_length=32)
+            G_tensor_batch = G_tensor_slice.unsqueeze(0)
 
             # 4. 物理感知 Smap 初始化 (全 GPU 并行傅里叶)
             cal_length = 32
@@ -167,52 +166,55 @@ def main():
                     
                     error_map = np.abs(ref_img - recon_img)
                     
+                    # 裁剪最终的线圈灵敏度图
                     c_final_cropped = center_crop(c_final, (320, 320))
-                    c_img = torch.abs(c_final_cropped).cpu().detach().numpy()[0, 0]
                     
-                    fig, axes = plt.subplots(1, 5, figsize=(20, 4))
+                    # ---------------------------------------------------------
+                    # 1. 第一张图：输出前四个 (欠采样图, 重建图, 原图, 误差图)
+                    # ---------------------------------------------------------
+                    fig, axes = plt.subplots(1, 4, figsize=(16, 4))
                     axes[0].imshow(under_mag_img, cmap='gray')
                     axes[0].set_title("Input (Zero-filled)")
                     axes[0].axis('off')
+                    
                     axes[1].imshow(recon_img, cmap='gray')
                     axes[1].set_title("Recon Image (u)")
                     axes[1].axis('off')
+                    
                     axes[2].imshow(ref_img, cmap='gray')
                     axes[2].set_title("Reference (GT)")
                     axes[2].axis('off')
+                    
                     axes[3].imshow(error_map, cmap='gray')
                     axes[3].set_title("Error Map")
                     axes[3].axis('off')
-                    axes[4].imshow(c_img, cmap='gray')
-                    axes[4].set_title("Estimated Smap (Coil 0)")
-                    axes[4].axis('off')
                     
                     plt.suptitle(f"Epoch {epoch+1} | Batch {batch_idx+1} - Result (Slice {current_slice})")
                     plt.tight_layout()
                     plt.savefig(os.path.join(image_save_dir, f'recon_epoch_{epoch+1:03d}_batch_{batch_idx+1:04d}.png'), bbox_inches='tight')
                     plt.close()
 
-                    fig_c, axes_c = plt.subplots(4, 5, figsize=(20, 16))
+                    # ---------------------------------------------------------
+                    # 2. 第二张图：显示更新完最终的 16 个通道的线圈灵敏度图
+                    # ---------------------------------------------------------
+                    # 创建 4x4 网格来放置 16 个通道
+                    fig_c, axes_c = plt.subplots(4, 4, figsize=(16, 16))
                     axes_c = axes_c.flatten() # 展平一维，方便用 for 循环遍历
                     
-                    for step_idx in range(num_steps):
-                        # 提取第 step_idx 层的敏感度图
-                        c_step_tensor = c_history[step_idx]
-                        c_step_cropped = center_crop(c_step_tensor, (320, 320))
-                        
-                        # 取出当前层 Coil 0 的幅值图，转到 CPU 上变 numpy
-                        c_step_img = torch.abs(c_step_cropped).cpu().detach().numpy()[0, 0]
+                    for coil_idx in range(16):  # 遍历 16 个通道
+                        # 取出当前通道的幅值图，转到 CPU 上变 numpy
+                        c_coil_img = torch.abs(c_final_cropped).cpu().detach().numpy()[0, coil_idx]
                         
                         # 画在对应的格子里
-                        axes_c[step_idx].imshow(c_step_img, cmap='gray')
-                        axes_c[step_idx].set_title(f"Step {step_idx + 1}")
-                        axes_c[step_idx].axis('off')
+                        axes_c[coil_idx].imshow(c_coil_img, cmap='gray')
+                        axes_c[coil_idx].set_title(f"Coil {coil_idx}")
+                        axes_c[coil_idx].axis('off')
                         
-                    plt.suptitle(f"Epoch {epoch+1} | Batch {batch_idx+1} - Smap Evolution (Coil 0)", fontsize=20)
+                    plt.suptitle(f"Epoch {epoch+1} | Batch {batch_idx+1} - Final Smap (16 Coils)", fontsize=20)
                     plt.tight_layout()
                     
                     # 额外保存为一张新图片
-                    plt.savefig(os.path.join(image_save_dir, f'smap_evolution_epoch_{epoch+1:03d}_batch_{batch_idx+1:04d}.png'), bbox_inches='tight')
+                    plt.savefig(os.path.join(image_save_dir, f'smap_final_epoch_{epoch+1:03d}_batch_{batch_idx+1:04d}.png'), bbox_inches='tight')
                     plt.close(fig_c)
 
         # 记录参数时，修改为如下逻辑
