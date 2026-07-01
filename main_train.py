@@ -21,7 +21,7 @@ from fastmri_dataset import JointFastMRIDataset
 from pisco_g_matrix import compute_G_for_fastmri_slice
 from networks import VariationalNetwork  
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 def center_crop(data, shape=(320, 320)):
