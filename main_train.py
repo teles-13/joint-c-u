@@ -43,7 +43,6 @@ def main():
     image_save_dir = 'recon_images'
     os.makedirs(image_save_dir, exist_ok=True)
     
-    # ⚠️ 确保聚焦第七个切片
     dataset = JointFastMRIDataset(data_dir=data_dir, target_shape=(16, 16, 640, 320), target_slice=7)
     dataloader = DataLoader(dataset, batch_size=1, shuffle=True, 
                             num_workers=4, pin_memory=True, 
@@ -51,7 +50,7 @@ def main():
     
     num_steps = 10
     model = VariationalNetwork(num_steps=num_steps, num_filters=24, inner_c_steps=10).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=5e-5)
+    optimizer = optim.Adam(model.parameters(), lr=1e-3)
     
     num_epochs = 1000
     loss_hist, mse_hist, ssim_hist, psnr_hist = [], [], [], []
@@ -69,7 +68,7 @@ def main():
         num_batches = len(dataloader)
         
         for batch_idx, data_dict in enumerate(dataloader):
-            # 1. 纯数据直接丢入 GPU
+            
             k_slice = data_dict['k_slice'].squeeze(0).to(device)       
             target_slice = data_dict['target_slice'].squeeze(0).to(device) 
             mask_2d = data_dict['sampling_mask'].squeeze(0).to(device) 
@@ -109,8 +108,7 @@ def main():
             
             rss_low = torch.sqrt(torch.sum(torch.abs(img_low) ** 2, dim=0, keepdim=True))
             rss_norm = rss_low / (rss_low.max() + 1e-8)
-            soft_mask = torch.sigmoid((rss_norm - 0.15) * 50)
-            c_init_slice = (img_low / (rss_low + 1e-8)) * soft_mask
+            c_init_slice = (img_low / (rss_low + 1e-8)) 
             c_init = c_init_slice.unsqueeze(0) 
 
             # 5. u 初始化 (GPU)
