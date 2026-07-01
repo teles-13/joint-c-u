@@ -45,16 +45,16 @@ class VNImageBlock(nn.Module):
         ops = MRPhysicsOperators()
         c_times_u = c_k * u_k 
         k_pred = ops.fft2c(c_times_u)
-        residual_img = ops.ifft2c(mask * (k_pred - f_kspace)) 
+        residual_img = ops.ifft2c(mask * ((mask * k_pred) - (mask * f_kspace))) 
         grad_u_fidelity = torch.sum(torch.conj(c_k) * residual_img, dim=1, keepdim=True) 
         u_mid = u_k - self.alpha_step * grad_u_fidelity
         
         u_real_imag = torch.cat([u_mid.real, u_mid.imag], dim=1) 
         features = self.feature_extractor(u_real_imag)
         u_residual = self.final_conv(features)
-        u_prior = u_real_imag + u_residual 
+        u_prior = u_real_imag + u_residual #残差
         
-        norm = torch.sqrt(u_prior[:, 0:1, ...]**2 + u_prior[:, 1:2, ...]**2 + 1e-8)
+        norm = torch.sqrt(u_prior[:, 0:1, ...]**2 + u_prior[:, 1:2, ...]**2 + 1e-8)#取通道 0（实部）和通道 1（虚部）的平方和开根号，得到每个像素点的幅度（Magnitude）
         scale = torch.clamp(self.radius / norm, max=1.0)
         u_prior_projected = u_prior * scale
         u_next = torch.complex(u_prior_projected[:, 0:1, ...], u_prior_projected[:, 1:2, ...]) 
@@ -66,7 +66,6 @@ class VNSensitivityBlock(nn.Module):
         self.beta_step = nn.Parameter(torch.tensor(-1.0, dtype=torch.float32))  
         self.lambda_reg = nn.Parameter(torch.tensor(-3.0, dtype=torch.float32)) 
 
-    # ⚠️ 彻底修复：参数签名去掉了 lamb 和 beta
     def forward(self, c_k, u_next, f_kspace, mask, G_tensor):
         ops = MRPhysicsOperators()
         
@@ -76,7 +75,7 @@ class VNSensitivityBlock(nn.Module):
         # 1. 计算数据保真项梯度
         c_times_u_next = c_k * u_next
         k_pred_next = ops.fft2c(c_times_u_next)
-        residual_img_next = ops.ifft2c(mask * (k_pred_next - f_kspace)) 
+        residual_img_next = (mask * (ops.ifft2c(mask * (k_pred_next - f_kspace)))) 
         grad_c_fidelity = torch.conj(u_next) * residual_img_next 
 
         # 2. 计算物理先验项梯度
@@ -85,11 +84,6 @@ class VNSensitivityBlock(nn.Module):
         # 3. 联合更新 c
         c_next = c_k - beta * (grad_c_fidelity + grad_c_prior)
         
-        # ==========================================================
-        # 删除软掩膜 (Soft Mask) 的计算，恢复纯粹的 RSS 归一化
-        # ==========================================================
-        c_rss = torch.sqrt(torch.sum(torch.abs(c_next)**2, dim=1, keepdim=True) + 1e-8)
-        c_next = c_next / c_rss
         
         return c_next
     
@@ -100,10 +94,10 @@ class VariationalNetwork(nn.Module):
         self.num_steps = num_steps
         self.inner_c_steps = inner_c_steps
         
-        # u 的更新次数不变：num_steps 个 block
+
         self.u_blocks = nn.ModuleList([VNImageBlock(num_filters) for _ in range(num_steps)])
         
-        # ⚠️ C 的更新次数暴增：需要 num_steps * inner_c_steps 个独立 block
+    
         self.c_blocks = nn.ModuleList([VNSensitivityBlock() for _ in range(num_steps * inner_c_steps)])
 
     def forward(self, f_kspace, mask, G_tensor, u_init, c_init):
