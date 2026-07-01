@@ -1,150 +1,156 @@
-import numpy as np
 import torch
+import numpy as np
 
 def even_pisco(int_val):
     return int_val % 2 == 0
 
 def ChC_FFT_convolutions(X, N1, N2, Nc, tau, pad, kernel_shape):
-    in1, in2 = np.meshgrid(np.arange(-tau, tau+1), np.arange(-tau, tau+1), indexing='xy')
+    device = X.device
+    grid_1d = torch.arange(-tau, tau+1, device=device)
+    in1, in2 = torch.meshgrid(grid_1d, grid_1d, indexing='xy')
+    
     if kernel_shape == 1:
         mask = in1**2 + in2**2 <= tau**2
-        i = np.where(mask.flatten(order='F'))[0]
+        mask_flat = mask.t().flatten() # 对应 order='F'
+        i = torch.where(mask_flat)[0]
     else:
-        i = np.arange(in1.size)
-    in1 = in1.flatten(order='F')[i]
-    in2 = in2.flatten(order='F')[i]
+        i = torch.arange(in1.numel(), device=device)
+        
+    in1 = in1.t().flatten()[i]
+    in2 = in2.t().flatten()[i]
     patchSize = len(in1)
 
     if pad:
-        N1n = 2 ** int(np.ceil(np.log2(N1 + 2*tau)))
-        N2n = 2 ** int(np.ceil(np.log2(N2 + 2*tau)))
+        import math
+        N1n = 2 ** math.ceil(math.log2(N1 + 2*tau))
+        N2n = 2 ** math.ceil(math.log2(N2 + 2*tau))
     else:
         N1n = N1
         N2n = N2
 
-    row_inds = (N1n // 2) - in1[:, np.newaxis] + in1[np.newaxis, :]
-    col_inds = (N2n // 2) - in2[:, np.newaxis] + in2[np.newaxis, :]
-    row_inds = np.clip(row_inds, 0, N1n-1).astype(int)
-    col_inds = np.clip(col_inds, 0, N2n-1).astype(int)
-    inds = np.ravel_multi_index((row_inds, col_inds), (N1n, N2n), order='F') 
+    row_inds = (N1n // 2) - in1.unsqueeze(1) + in1.unsqueeze(0)
+    col_inds = (N2n // 2) - in2.unsqueeze(1) + in2.unsqueeze(0)
+    row_inds = torch.clamp(row_inds, 0, N1n-1).long()
+    col_inds = torch.clamp(col_inds, 0, N2n-1).long()
+    
+    # 对应 order='F' 的线性索引
+    inds = col_inds * N1n + row_inds
+    
+    n1_freq = torch.fft.fftshift(torch.fft.fftfreq(N1n, device=device))
+    n2_freq = torch.fft.fftshift(torch.fft.fftfreq(N2n, device=device))
+    n2, n1 = torch.meshgrid(n2_freq, n1_freq, indexing='xy')
+    
+    phaseKernel = torch.exp(-1j * 2 * torch.pi * (n1 * ((N1n+1)//2 + tau) + n2 * ((N2n+1)//2 + tau)))
+    cphaseKernel = torch.exp(-1j * 2 * torch.pi * (n1 * ((N1n+1)//2) + n2 * ((N2n+1)//2)))
 
-    n1_freq = np.fft.fftshift(np.fft.fftfreq(N1n))
-    n2_freq = np.fft.fftshift(np.fft.fftfreq(N2n))
-    n2, n1 = np.meshgrid(n2_freq, n1_freq, indexing='xy')
+    x = torch.fft.fft2(X, s=(N1n, N2n), dim=(0,1)) * phaseKernel.unsqueeze(2)
 
-    phaseKernel = np.exp(-1j * 2 * np.pi * (n1 * ((N1n+1)//2 + tau) + n2 * ((N2n+1)//2 + tau)))
-    cphaseKernel = np.exp(-1j * 2 * np.pi * (n1 * ((N1n+1)//2) + n2 * ((N2n+1)//2)))
-
-    x = np.fft.fft2(X, s=(N1n, N2n), axes=(0,1)) * phaseKernel[:, :, np.newaxis]
-
-    PhP = np.zeros((patchSize, patchSize, Nc, Nc), dtype=complex)
+    PhP = torch.zeros((patchSize, patchSize, Nc, Nc), dtype=torch.complex64, device=device)
     for q in range(Nc):
         x_rest = x[:, :, q:]
         x_q = x[:, :, q] 
-        prod = np.conj(x_rest) * x_q[:, :, np.newaxis] * cphaseKernel[:, :, np.newaxis]
-        b = np.fft.ifft2(prod, axes=(0,1)) 
+        prod = torch.conj(x_rest) * x_q.unsqueeze(2) * cphaseKernel.unsqueeze(2)
+        b = torch.fft.ifft2(prod, dim=(0,1)) 
 
-        b = b.reshape(-1, Nc - q, order='F') 
-        b_selected = b[inds.flatten(order='F'), :] 
-        b_selected = b_selected.reshape(patchSize, patchSize, Nc - q, order='F')
-
+        # 完美复现 reshape(..., order='F') 
+        b_flat = b.permute(1, 0, 2).reshape(-1, Nc - q)
+        inds_flat = inds.t().flatten()
+        b_selected = b_flat[inds_flat, :]
+        b_selected = b_selected.view(patchSize, patchSize, Nc - q).permute(1, 0, 2)
+        
         PhP[:, :, q:, q] = b_selected
         if q < Nc - 1:
-            PhP[:, :, q, q+1:] = np.conj(PhP[:, :, q+1:, q].transpose(1, 0, 2))
+            PhP[:, :, q, q+1:] = torch.conj(PhP[:, :, q+1:, q].permute(1, 0, 2))
 
-    PhP = PhP.transpose(0, 2, 1, 3) 
-    PhP = PhP.reshape(patchSize * Nc, patchSize * Nc, order='F')
+    PhP = PhP.permute(0, 2, 1, 3) 
+    PhP = PhP.permute(3, 2, 1, 0).reshape(patchSize * Nc, patchSize * Nc).t()
     return PhP
 
 def nullspace_vectors_C_matrix(kCal, tau, threshold, kernel_shape):
-    # 直接使用高效的 FFT 卷积计算 C^H * C
     ChC = ChC_FFT_convolutions(kCal, kCal.shape[0], kCal.shape[1], kCal.shape[2], tau, 1, kernel_shape)
-    _, s, vh = np.linalg.svd(ChC, full_matrices=False)
-    sing = np.sqrt(np.abs(s))
+    # 极速 GPU SVD 分解
+    U_svd, S, Vh = torch.linalg.svd(ChC, full_matrices=False)
+    sing = torch.sqrt(torch.abs(S))
     sing = sing / sing[0]
-    Nvect = np.where(sing >= threshold * sing[0])[0][-1]
-    U = vh.conj().T[:, Nvect+1:]  # 提取零空间对应的右奇异向量
+    
+    valid_idx = torch.where(sing >= threshold * sing[0])[0]
+    Nvect = valid_idx[-1].item()
+    
+    U = Vh.conj().t()[:, Nvect+1:] 
     return U
 
 def G_matrices(kCal, N1, N2, tau, U, kernel_shape):
+    device = kCal.device
     N1_cal, N2_cal, Nc = kCal.shape
-    in1, in2 = np.meshgrid(np.arange(-tau, tau + 1), np.arange(-tau, tau + 1))
+    grid_1d = torch.arange(-tau, tau + 1, device=device)
+    in1, in2 = torch.meshgrid(grid_1d, grid_1d, indexing='xy')
     
-    flat_in1 = in1.flatten(order='F')
-    flat_in2 = in2.flatten(order='F')
+    flat_in1 = in1.t().flatten()
+    flat_in2 = in2.t().flatten()
+    
     if kernel_shape == 0:
-        ind = np.arange(len(flat_in1))
+        ind = torch.arange(len(flat_in1), device=device)
     else:
         mask = in1**2 + in2**2 <= tau**2
-        ind = np.where(mask.flatten(order='F'))[0]
-    in1 = flat_in1[ind].astype(int)
-    in2 = flat_in2[ind].astype(int)
+        ind = torch.where(mask.t().flatten())[0]
+        
+    in1 = flat_in1[ind].long()
+    in2 = flat_in2[ind].long()
     
     patchSize = len(in1)
-    eind = np.arange(patchSize, 0, -1) - 1
+    eind = torch.arange(patchSize, 0, -1, device=device) - 1
     total_size = 2 * (2 * tau + 1)
-    G_flat = np.zeros(( (2*(2*tau+1)) * (2*(2*tau+1)), Nc, Nc), dtype=complex)
     
-    W = U @ U.conj().T
-    W = W.reshape(patchSize, Nc, patchSize, Nc, order='F').transpose(0, 1, 3, 2)
+    G_flat = torch.zeros((total_size * total_size, Nc, Nc), dtype=torch.complex64, device=device)
+    
+    W = U @ U.conj().t()
+    W = W.t().reshape(Nc, patchSize, Nc, patchSize).permute(3, 2, 1, 0)
+    W = W.permute(0, 1, 3, 2)
     
     for s in range(patchSize):
         r0 = 2 * tau + 1 + in1[eind] + in1[s] 
         c0 = 2 * tau + 1 + in2[eind] + in2[s] 
-        r0 = np.clip(r0, 0, total_size-1)
-        c0 = np.clip(c0, 0, total_size-1)
+        r0 = torch.clamp(r0, 0, total_size-1)
+        c0 = torch.clamp(c0, 0, total_size-1)
         linear_idx = c0 * total_size + r0 
         G_flat[linear_idx, :, :] += W[:, :, :, s]
 
-    G = G_flat.reshape(total_size, total_size, Nc, Nc, order='F')  
+    G = G_flat.permute(2, 1, 0).reshape(Nc, Nc, total_size, total_size).permute(3, 2, 1, 0)
     
     N1_g, N2_g = N1, N2 
-    # 1. 必须使用 unshifted 的频率，对齐 IFFT 的标准输出顺序
-    n1 = np.fft.fftfreq(N1_g)
-    n2 = np.fft.fftfreq(N2_g)
-    n2, n1 = np.meshgrid(n2, n1, indexing='xy')
+    n1 = torch.fft.fftfreq(N1_g, device=device)
+    n2 = torch.fft.fftfreq(N2_g, device=device)
+    n2, n1 = torch.meshgrid(n2, n1, indexing='xy')
     
-    # 相位核不变，但此时输入的 n1, n2 已经是正确对齐的了
-    phaseKernel = np.exp(-1j * 2 * np.pi * (n1 * (N1_g - 2*tau - 1) + n2 * (N2_g - 2*tau - 1)))
-    
-    # 2. 必须去掉 np.conj，并使用 ifft2 匹配从频域到空间域的正向复指数映射
-    G = np.fft.ifft2(G, s=(N1_g, N2_g), axes=(0,1)) * phaseKernel[:, :, np.newaxis, np.newaxis]
-    
-    # 3. 最后再将空间图像居中
-    G = np.fft.fftshift(G, axes=(0,1))
-    # --- 修正结束 ---
+    phaseKernel = torch.exp(-1j * 2 * torch.pi * (n1 * (N1_g - 2*tau - 1) + n2 * (N2_g - 2*tau - 1)))
+    G = torch.fft.ifft2(G, s=(N1_g, N2_g), dim=(0,1)) * phaseKernel.unsqueeze(2).unsqueeze(3)
+    G = torch.fft.fftshift(G, dim=(0,1))
     
     return G
 
 def compute_G_for_fastmri_slice(kspace_slice, cal_length=32, tau=3, threshold=0.08, kernel_shape=1):
     """
-    针对 FastMRI 的预处理包装函数。
+    针对 FastMRI 的预处理包装函数（全 GPU 运行版）。
     输入:
-        kspace_slice: numpy array, 形状为 (Nc, N1, N2)，即 (通道数, 宽, 高)
+        kspace_slice: PyTorch Tensor, 形状为 (Nc, N1, N2)，必须已经在 GPU 上
     输出:
-        G_tensor: PyTorch Complex Tensor, 形状为 (N1, N2, Nc, Nc)
+        G_tensor: PyTorch Tensor, 形状为 (N1, N2, Nc, Nc)，在 GPU 上
     """
-    # 1. 调整维度 (Nc, N1, N2) -> (N1, N2, Nc) 以适配 PISCO 逻辑
-    kData = np.transpose(kspace_slice, (1, 2, 0))
+    kData = kspace_slice.permute(1, 2, 0)
     N1, N2, Nc = kData.shape
+    device = kData.device
     
-    # 2. 提取 ACS 校准区 (Calibration Data)
     center_x = int(np.ceil(N1 / 2)) + even_pisco(N1)
     center_y = int(np.ceil(N2 / 2)) + even_pisco(N2)
     
-    cal_index_x = np.arange(center_x - int(np.floor(cal_length / 2)), 
-                            center_x + int(np.floor(cal_length / 2)) - even_pisco(cal_length))
-    cal_index_y = np.arange(center_y - int(np.floor(cal_length / 2)), 
-                            center_y + int(np.floor(cal_length / 2)) - even_pisco(cal_length))
+    cal_index_x = torch.arange(center_x - int(np.floor(cal_length / 2)), 
+                               center_x + int(np.floor(cal_length / 2)) - even_pisco(cal_length), device=device)
+    cal_index_y = torch.arange(center_y - int(np.floor(cal_length / 2)), 
+                               center_y + int(np.floor(cal_length / 2)) - even_pisco(cal_length), device=device)
     
-    kCal = kData[cal_index_x[:, np.newaxis], cal_index_y, :]
+    kCal = kData[cal_index_x.unsqueeze(1), cal_index_y, :]
     
-    # 3. 核心计算：获取零空间 U，然后计算 G
     U = nullspace_vectors_C_matrix(kCal, tau, threshold, kernel_shape)
-    G_matrix = G_matrices(kCal, N1, N2, tau, U, kernel_shape)
-    
-    # 4. 转化为 PyTorch Tensor 输出，方便直接存入 DataLoader
-    # G_matrix 形状已经是 (N1, N2, Nc, Nc)
-    G_tensor = torch.from_numpy(G_matrix).to(torch.complex64)
+    G_tensor = G_matrices(kCal, N1, N2, tau, U, kernel_shape)
     
     return G_tensor
