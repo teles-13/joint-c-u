@@ -45,7 +45,7 @@ class VNImageBlock(nn.Module):
         ops = MRPhysicsOperators()
         c_times_u = c_k * u_k 
         k_pred = ops.fft2c(c_times_u)
-        residual_img = ops.ifft2c(mask * ((mask * k_pred) - (mask * f_kspace))) 
+        residual_img = ops.ifft2c(mask * (k_pred - f_kspace)) 
         grad_u_fidelity = torch.sum(torch.conj(c_k) * residual_img, dim=1, keepdim=True) 
         u_mid = u_k - self.alpha_step * grad_u_fidelity
         
@@ -63,7 +63,7 @@ class VNImageBlock(nn.Module):
 class VNSensitivityBlock(nn.Module):
     def __init__(self):
         super().__init__()
-        self.beta_step = nn.Parameter(torch.tensor(-1.0, dtype=torch.float32))  
+        self.beta_step = nn.Parameter(torch.tensor(-4.0, dtype=torch.float32))  
         self.lambda_reg = nn.Parameter(torch.tensor(-3.0, dtype=torch.float32)) 
 
     def forward(self, c_k, u_next, f_kspace, mask, G_tensor):
@@ -75,15 +75,36 @@ class VNSensitivityBlock(nn.Module):
         # 1. 计算数据保真项梯度
         c_times_u_next = c_k * u_next
         k_pred_next = ops.fft2c(c_times_u_next)
-        residual_img_next = (mask * (ops.ifft2c(mask * (k_pred_next - f_kspace)))) 
+        residual_img_next = ops.ifft2c(mask * (k_pred_next - f_kspace))
         grad_c_fidelity = torch.conj(u_next) * residual_img_next 
+
+        # =====================================================================
+        # 🌟 核心修复：对敏感度梯度进行 K 空间低通滤波，防止高频图像细节和伪影串扰
+        # =====================================================================
+        grad_c_k = ops.fft2c(grad_c_fidelity)
+        _, _, H, W = grad_c_k.shape
+        cal_length = 32
+        
+        h_start, h_end = H // 2 - cal_length // 2, H // 2 + cal_length // 2
+        w_start, w_end = W // 2 - cal_length // 2, W // 2 + cal_length // 2
+        
+        # 生成二维 Hann 窗，平滑衰减边缘防止吉布斯振铃
+        window_1d = torch.hann_window(cal_length, periodic=False, device=grad_c_k.device)
+        window_2d = window_1d.unsqueeze(1) * window_1d.unsqueeze(0)
+        
+        # 置零高频区域，只保留加窗后的低频中心
+        grad_c_k_filtered = torch.zeros_like(grad_c_k)
+        grad_c_k_filtered[..., h_start:h_end, w_start:w_end] = grad_c_k[..., h_start:h_end, w_start:w_end] * window_2d
+        
+        # 转换回图像域，得到平滑的梯度
+        grad_c_fidelity = ops.ifft2c(grad_c_k_filtered)
+        # =====================================================================
 
         # 2. 计算物理先验项梯度
         grad_c_prior = lamb * torch.einsum('bhwij, bjhw -> bihw', G_tensor, c_k)
 
         # 3. 联合更新 c
         c_next = c_k - beta * (grad_c_fidelity + grad_c_prior)
-        
         
         return c_next
     
